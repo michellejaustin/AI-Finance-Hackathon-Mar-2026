@@ -832,6 +832,7 @@ def calculate_kpis(data):
         bank.loc[bank_exception_mask, "Match Status"].value_counts().sort_values(ascending=False).to_dict()
     )
     bank_agent = _build_bank_agent(bank)
+    journal_agent = _build_journal_agent(accruals)
 
     ic_exception_mask = ~ic["Elimination Status"].eq("Eliminated")
     ic_exceptions = int(ic_exception_mask.sum())
@@ -1106,6 +1107,8 @@ def calculate_kpis(data):
         "bank_escalations": bank_agent["summary"]["escalations"],
         "bank_manual_investigations": bank_agent["summary"]["manual_investigations"],
         "bank_statement_break_value": round(bank_agent["summary"]["statement_break_value"], 2),
+        "journal_agent_ready_drafts": journal_agent["summary"]["erp_ready_drafts"],
+        "journal_agent_review_needed": journal_agent["summary"]["review_needed"],
         "ic_exceptions": ic_exceptions,
         "ic_total_diff": round(ic_total_diff, 2),
         "accrual_risks": accrual_risks,
@@ -1141,6 +1144,7 @@ def calculate_kpis(data):
         "details": details,
         "agents": {
             "bank": bank_agent,
+            "journal": journal_agent,
         },
     }
 
@@ -1360,6 +1364,8 @@ def _route_copilot_intent(prompt):
 
     if any(keyword in text for keyword in ["bank agent", "bank reconciliation agent", "bank rec agent", "cash agent"]):
         return "bank_agent"
+    if any(keyword in text for keyword in ["journal agent", "je agent", "journal entry agent", "what should the journal agent post"]):
+        return "journal_agent"
     if any(keyword in text for keyword in ["riskiest entity", "which entity", "entity risk", "entity is riskiest"]):
         return "riskiest_entity"
     if any(keyword in text for keyword in ["variance", "trial balance", "tb"]):
@@ -1380,6 +1386,7 @@ def generate_copilot_response(prompt, kpis, score, priorities):
     entities = kpis["entities"]
     details = kpis["details"]
     bank_agent = kpis["agents"]["bank"]
+    journal_agent = kpis["agents"]["journal"]
     top_priorities = priorities[:3]
     top_entity = entities[0] if entities else None
     top_variances = details["tb_variances"].head(3)
@@ -1388,6 +1395,7 @@ def generate_copilot_response(prompt, kpis, score, priorities):
     follow_ups = [
         "What issues will delay the close?",
         "What should the bank agent do next?",
+        "What should the journal agent post?",
         "What should the controller do today?",
         "Which entity is riskiest?",
         "Explain the biggest variances.",
@@ -1493,10 +1501,29 @@ def generate_copilot_response(prompt, kpis, score, priorities):
             f"{bank_agent['summary']['escalations']} escalations",
             f"{bank_agent['summary']['manual_investigations']} manual investigations",
         ]
+    elif intent == "journal_agent":
+        drafts = journal_agent["erp_journal_drafts"].head(3)
+        draft_lines = [
+            f"- {row['Journal ID']}: {row['Entity']} | {row['JE Type']} | EUR {row['Amount (EUR)']:,.2f}"
+            for _, row in drafts.iterrows()
+        ]
+        answer = (
+            f"The journal entry agent has reviewed {journal_agent['summary']['candidate_items']} accrual candidates and prepared "
+            f"{journal_agent['summary']['erp_ready_drafts']} draft JEs ready for ERP posting. "
+            f"Those include {journal_agent['summary']['contract_backed_drafts']} contract-backed accruals and "
+            f"{journal_agent['summary']['standard_reclasses']} standard reclassifications. Every candidate has an attached AI audit trail.\n\n"
+            + "\n".join(draft_lines)
+        )
+        source_metrics = [
+            f"{journal_agent['summary']['erp_ready_drafts']} ERP-ready drafts",
+            f"{journal_agent['summary']['contract_backed_drafts']} contract-backed",
+            f"{journal_agent['summary']['standard_reclasses']} reclasses",
+            f"{journal_agent['summary']['audit_trails_attached']} audit trails",
+        ]
     else:
         answer = (
             "NovaClose Copilot is optimized for close blockers, today’s controller actions, automation opportunities, "
-            "bank reconciliation triage, riskiest entity analysis, and trial balance variance summaries. Start with one of those questions and I’ll answer using the dataset already loaded into the app."
+            "bank reconciliation triage, journal drafting, riskiest entity analysis, and trial balance variance summaries. Start with one of those questions and I’ll answer using the dataset already loaded into the app."
         )
         source_metrics = [
             f"{summary['pending_gl']} pending GL",

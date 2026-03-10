@@ -42,6 +42,7 @@ DETAIL_MAP = {
 QUICK_PROMPTS = [
     "What issues will delay the close?",
     "What should the bank agent do next?",
+    "What should the journal agent post?",
     "What should the controller do today?",
     "Which entity is riskiest?",
     "Explain the biggest variances.",
@@ -805,6 +806,55 @@ def build_bank_entity_chart(bank_agent):
     return chart_data.set_index("Entity")
 
 
+def build_journal_type_chart(journal_agent):
+    chart_data = journal_agent["type_breakdown"].copy()
+    if HAS_PLOTLY:
+        figure = px.pie(
+            chart_data,
+            names="JE Type",
+            values="Count",
+            hole=0.55,
+            color="JE Type",
+            color_discrete_sequence=["#143642", "#256d85", "#d77a2d", "#c75c5c"],
+        )
+        figure.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=10, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            showlegend=True,
+        )
+        return figure
+
+    return chart_data.set_index("JE Type")
+
+
+def build_journal_entity_chart(journal_agent):
+    chart_data = journal_agent["entity_breakdown"].copy().sort_values("Drafts")
+    if HAS_PLOTLY:
+        figure = px.bar(
+            chart_data,
+            x="Drafts",
+            y="Entity",
+            orientation="h",
+            text="Drafts",
+            color="Drafts",
+            color_continuous_scale=["#9fc5d1", "#d77a2d", "#c75c5c"],
+        )
+        figure.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            coloraxis_showscale=False,
+            xaxis_title="",
+            yaxis_title="",
+        )
+        figure.update_traces(marker_line_width=0, textposition="outside")
+        return figure
+
+    return chart_data.set_index("Entity")
+
+
 def build_entity_chart(entities):
     entity_data = pd.DataFrame(entities).sort_values("risk_score")
     if HAS_PLOTLY:
@@ -1184,6 +1234,113 @@ def render_bank_agent(kpis):
         )
 
 
+def render_journal_agent(kpis):
+    journal_agent = kpis["agents"]["journal"]
+    summary = journal_agent["summary"]
+
+    st.markdown(
+        f"""
+        <div class="entity-callout">
+            <div class="section-label">Journal Entry Agent</div>
+            <div class="entity-name">{summary['erp_ready_drafts']} draft JEs ready for ERP posting</div>
+            <div class="entity-copy">
+                The journal agent reads accrual support, applies standard reclassification rules, and appends an AI-style
+                audit trail to every candidate before deciding whether the draft is ERP-ready or still needs controller review.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    card_cols = st.columns(5, gap="medium")
+    with card_cols[0]:
+        render_metric_card(
+            "ERP-Ready Drafts",
+            str(summary["erp_ready_drafts"]),
+            "Draft journal entries that are ready to move into the ERP posting workflow.",
+            "high",
+        )
+    with card_cols[1]:
+        render_metric_card(
+            "Contract-Backed",
+            str(summary["contract_backed_drafts"]),
+            "Drafts supported by contract references, POs, or email confirmations.",
+            "medium",
+        )
+    with card_cols[2]:
+        render_metric_card(
+            "Std. Reclasses",
+            str(summary["standard_reclasses"]),
+            "Rule-based reclassification drafts for recurring close patterns.",
+            "medium",
+        )
+    with card_cols[3]:
+        render_metric_card(
+            "Audit Trails",
+            str(summary["audit_trails_attached"]),
+            "Every candidate carries an AI-generated audit trail narrative.",
+            "medium",
+        )
+    with card_cols[4]:
+        render_metric_card(
+            "Review Needed",
+            str(summary["review_needed"]),
+            "Candidates that still need support or controller review before ERP posting.",
+            "high",
+        )
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("<div class='section-label'>JE Type Mix</div>", unsafe_allow_html=True)
+        type_chart = build_journal_type_chart(journal_agent)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                type_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="journal_agent_type_chart",
+            )
+        else:
+            st.bar_chart(type_chart)
+
+    with right:
+        st.markdown("<div class='section-label'>ERP-Ready Drafts by Entity</div>", unsafe_allow_html=True)
+        entity_chart = build_journal_entity_chart(journal_agent)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                entity_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="journal_agent_entity_chart",
+            )
+        else:
+            st.bar_chart(entity_chart)
+
+    upper_left, upper_right = st.columns(2, gap="large")
+    with upper_left:
+        st.markdown("<div class='section-label'>ERP-Ready JE Drafts</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(journal_agent["erp_journal_drafts"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with upper_right:
+        st.markdown("<div class='section-label'>Candidate Worklist</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(journal_agent["worklist"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("<div class='section-label'>AI Audit Trail Pack</div>", unsafe_allow_html=True)
+    st.dataframe(
+        format_display_frame(journal_agent["audit_trails"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def render_priority_engine(priorities):
     recoverable_hours = sum(priority["hours_saved_est"] for priority in priorities[:4])
 
@@ -1351,8 +1508,16 @@ with st.sidebar:
 data, kpis, score, priorities, commentary = prepare(data_source)
 reset_copilot_if_needed(dataset_key_for(data_source), kpis, score, priorities)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Command Center", "Risk Atlas", "Bank Agent", "Priority Engine", "Automation Plays", "Entity View"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    [
+        "Command Center",
+        "Risk Atlas",
+        "Bank Agent",
+        "Journal Agent",
+        "Priority Engine",
+        "Automation Plays",
+        "Entity View",
+    ]
 )
 
 with tab1:
@@ -1365,12 +1530,15 @@ with tab3:
     render_bank_agent(kpis)
 
 with tab4:
-    render_priority_engine(priorities)
+    render_journal_agent(kpis)
 
 with tab5:
-    render_automation_plays()
+    render_priority_engine(priorities)
 
 with tab6:
+    render_automation_plays()
+
+with tab7:
     render_entity_view(kpis)
 
 st.divider()
