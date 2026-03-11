@@ -2,6 +2,7 @@ from html import escape
 from itertools import combinations
 from pathlib import Path
 from textwrap import dedent
+import json
 import re
 
 import numpy as np
@@ -84,6 +85,39 @@ def safe_rerun():
     rerun_fn = getattr(st, "experimental_rerun", None)
     if callable(rerun_fn):
         rerun_fn()
+
+
+def planning_signature(kpis):
+    summary = kpis["summary"]
+    return json.dumps(summary, sort_keys=True, default=str)
+
+
+def get_planning_cache():
+    return st.session_state.setdefault("_planning_cache", {})
+
+
+def get_cached_actions(kpis):
+    cache = get_planning_cache()
+    key = ("actions", planning_signature(kpis))
+    if key not in cache:
+        cache[key] = build_scenario_actions(kpis)
+    return cache[key]
+
+
+def get_cached_plan_scenario(kpis, action_ids):
+    cache = get_planning_cache()
+    key = ("scenario", planning_signature(kpis), tuple(sorted(action_ids)))
+    if key not in cache:
+        cache[key] = simulate_close_scenario(kpis, action_ids)
+    return cache[key]
+
+
+def get_cached_recommendations(kpis):
+    cache = get_planning_cache()
+    key = ("recommendations", planning_signature(kpis))
+    if key not in cache:
+        cache[key] = build_below_four_recommendations(kpis)
+    return cache[key]
 
 
 def format_number(value, decimals=0):
@@ -759,6 +793,10 @@ def apply_theme():
             min-height: 152px;
         }
 
+        .metric-card.split-card {
+            min-height: 188px;
+        }
+
         .metric-label {
             color: var(--muted);
             font-size: 0.8rem;
@@ -796,6 +834,35 @@ def apply_theme():
 
         .metric-card.low .metric-value {
             color: var(--good);
+        }
+
+        .split-metric-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.7rem;
+            margin-bottom: 0.6rem;
+        }
+
+        .split-metric-panel {
+            background: rgba(20, 54, 66, 0.04);
+            border: 1px solid rgba(20, 54, 66, 0.08);
+            border-radius: 16px;
+            padding: 0.6rem 0.45rem 0.55rem 0.45rem;
+        }
+
+        .split-metric-tag {
+            text-align: center;
+            color: var(--muted);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+
+        .split-card .metric-value {
+            margin-bottom: 0;
+            font-size: 1.75rem;
         }
 
         .priority-card.medium .priority-score {
@@ -1570,6 +1637,30 @@ def render_metric_card(title, value, subtitle, tone="medium"):
     )
 
 
+def render_before_after_metric_card(title, before_value, after_value, subtitle, before_tone="medium", after_tone="low"):
+    before_display = format_metric_value(before_value)
+    after_display = format_metric_value(after_value)
+    st.markdown(
+        f"""
+        <div class="metric-card split-card">
+            <div class="metric-label">{title}</div>
+            <div class="split-metric-grid">
+                <div class="split-metric-panel">
+                    <div class="split-metric-tag">Before</div>
+                    <div class="metric-value {before_tone}">{before_display}</div>
+                </div>
+                <div class="split-metric-panel">
+                    <div class="split-metric-tag">After</div>
+                    <div class="metric-value {after_tone}">{after_display}</div>
+                </div>
+            </div>
+            <div class="metric-subtitle">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_kpi_strip(summary):
     pending_actions = summary["not_started_tasks"] + summary["blocked_tasks"]
     high_risk_items = summary["accrual_risks"] + summary["ap_3way_exceptions"]
@@ -1706,12 +1797,12 @@ def render_ai_opportunity(title, copy):
     )
 
 
-def render_focus_board(kpis, score, priorities):
+def render_focus_board(kpis, score, priorities, recommendations):
     summary = kpis["summary"]
     posting = kpis["agents"]["erp_posting"]["summary"]
     checklist_agent = kpis["agents"]["checklist"]
     top_priorities = priorities[:3]
-    recs = build_below_four_recommendations(kpis)
+    recs = recommendations
 
     if recs.empty:
         bundle_text = "No tested bundle gets below 4.0 days yet."
@@ -1984,7 +2075,7 @@ def render_entity_callout(entity):
     )
 
 
-def build_readiness_gauge(score):
+def build_readiness_gauge(score, title="Close Readiness"):
     if not HAS_PLOTLY:
         return None
 
@@ -1993,7 +2084,7 @@ def build_readiness_gauge(score):
             mode="gauge+number",
             value=score["readiness_score"],
             number={"suffix": "/100", "font": {"size": 34, "color": "#143642"}},
-            title={"text": "Close Readiness", "font": {"size": 16, "color": "#5b6b78"}},
+            title={"text": title, "font": {"size": 16, "color": "#5b6b78"}},
             gauge={
                 "axis": {"range": [0, 100], "tickwidth": 0, "tickcolor": "#5b6b78"},
                 "bar": {"color": "#143642"},
@@ -2638,45 +2729,23 @@ def render_chat(kpis, score, priorities):
         safe_rerun()
 
 
-def render_command_center(kpis, score, priorities, commentary):
+def render_command_center(
+    kpis,
+    score,
+    priorities,
+    commentary,
+    actions,
+    recommendations,
+    baseline_score,
+    automation_score,
+    automation_run,
+):
     summary = kpis["summary"]
     riskiest_entity = kpis["entities"][0]
-    actions = build_scenario_actions(kpis)
 
     render_kpi_strip(summary)
-    render_focus_board(kpis, score, priorities)
+    render_focus_board(kpis, score, priorities, recommendations)
     render_me_steps(kpis, actions)
-    render_action_queue(kpis)
-
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="hero-eyebrow">Predictive Close Intelligence</div>
-            <div class="hero-grid">
-                <div>
-                    <div class="hero-title">NovaClose Command Centre</div>
-                    <p class="hero-copy">
-                        NovaTech is not missing its target because finance cannot process transactions.
-                        It is missing because exceptions, approvals, and dependencies are surfacing too late in the close.
-                        This demo turns that operational noise into a ranked action plan.
-                    </p>
-                </div>
-                <div class="hero-side">
-                    <div class="hero-side-label">Live Readout</div>
-                    <div class="hero-side-value">{score['predicted_close_days']} day projected close</div>
-                    <div class="hero-side-copy">
-                        {score['gap_to_target_days']} days above the 4-day CFO target.
-                        Highest current entity risk: {summary['riskiest_entity']}.
-                    </div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    render_close_intelligence(summary, kpis)
-    render_close_timeline(summary)
 
     card_cols = st.columns(4)
     with card_cols[0]:
@@ -2708,49 +2777,55 @@ def render_command_center(kpis, score, priorities, commentary):
             tone_from_score(100 - riskiest_entity["risk_score"]),
         )
 
-    left, right = st.columns([1.12, 0.88], gap="large")
-    with left:
-        st.markdown("<div class='section-label tight-top'>Close Signal</div>", unsafe_allow_html=True)
-        gauge = build_readiness_gauge(score)
+    st.markdown("<div class='section-label tight-top'>Close Signal</div>", unsafe_allow_html=True)
+    before_col, after_col = st.columns(2, gap="medium")
+    after_label = "After Automation" if automation_run else "Projected After"
+    delta_points = automation_score["readiness_score"] - baseline_score["readiness_score"]
+
+    with before_col:
+        st.markdown("<div class='section-label'>Before</div>", unsafe_allow_html=True)
+        gauge = build_readiness_gauge(baseline_score, "Close Readiness")
         if gauge is not None:
             st.plotly_chart(
                 gauge,
                 use_container_width=True,
                 config={"displayModeBar": False},
-                key="command_center_readiness_gauge",
+                key="command_center_readiness_gauge_before",
             )
         else:
             st.info("Install `plotly` to unlock the full readiness gauge.")
-            st.progress(score["readiness_score"] / 100)
+            st.progress(baseline_score["readiness_score"] / 100)
 
-        st.markdown("<div class='section-label'>Executive Narrative</div>", unsafe_allow_html=True)
-        st.info(commentary)
+    with after_col:
+        st.markdown(f"<div class='section-label'>{after_label}</div>", unsafe_allow_html=True)
+        gauge = build_readiness_gauge(automation_score, "Close Readiness")
+        if gauge is not None:
+            st.plotly_chart(
+                gauge,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="command_center_readiness_gauge_after",
+            )
+        else:
+            st.info("Install `plotly` to unlock the full readiness gauge.")
+            st.progress(automation_score["readiness_score"] / 100)
 
-        with st.expander("Risk by area", expanded=False):
-            area_chart = build_area_chart(kpis)
-            if HAS_PLOTLY:
-                st.plotly_chart(
-                    area_chart,
-                    use_container_width=True,
-                    config={"displayModeBar": False},
-                    key="command_center_area_chart",
-                )
-            else:
-                st.bar_chart(area_chart)
+    st.markdown(
+        f"<span class='focus-chip'>Readiness delta: {format_number(delta_points, 0)} points</span>",
+        unsafe_allow_html=True,
+    )
 
-    with right:
-        st.markdown(
-            """
-            <div class="entity-callout">
-                <div class="section-label">AI Copilot</div>
-                <div class="entity-name">Open the AI Copilot tab for live Q&A</div>
-                <div class="entity-copy">
-                    The full copilot experience is now centralized to reduce clutter across tabs.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    with st.expander("Risk by area", expanded=False):
+        area_chart = build_area_chart(kpis)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                area_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="command_center_area_chart",
+            )
+        else:
+            st.bar_chart(area_chart)
 
     footer_cols = st.columns([0.92, 1.08], gap="large")
     with footer_cols[0]:
@@ -2767,6 +2842,33 @@ def render_command_center(kpis, score, priorities, commentary):
             )
         else:
             st.bar_chart(checklist_chart)
+
+    render_action_queue(kpis)
+
+    st.markdown(
+        f"""
+        <div class="hero">
+            <div class="hero-grid">
+                <div>
+                    <div class="hero-title">NovaClose Command Centre</div>
+                    <p class="hero-copy">Ranked actions, automation impact, and close readiness in one view.</p>
+                </div>
+                <div class="hero-side">
+                    <div class="hero-side-label">Live Readout</div>
+                    <div class="hero-side-value">{score['predicted_close_days']} day projected close</div>
+                    <div class="hero-side-copy">
+                        {score['gap_to_target_days']} days above the 4-day CFO target.
+                        Highest current entity risk: {summary['riskiest_entity']}.
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    render_close_intelligence(summary, kpis)
+    render_close_timeline(summary)
 
 
 def render_risk_atlas(kpis):
@@ -2805,10 +2907,7 @@ def render_gl_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">GL Approval Agent</div>
             <div class="entity-name">{summary['straight_through_candidates']} journals ready for straight-through approval</div>
-            <div class="entity-copy">
-                The GL approval agent triages the pending journal queue into straight-through, manager, controller, and CFO lanes
-                so the team can bulk-approve low-risk items and isolate the real escalation work.
-            </div>
+            <div class="entity-copy">Approval lanes split low-risk batchable journals from real escalation items.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2879,12 +2978,6 @@ def render_gl_agent(kpis):
             hide_index=True,
         )
 
-    render_ai_opportunity(
-        "AI Opportunity",
-        f"Auto-approve {summary['straight_through_candidates']} straight-through journals and batch the manager/controller queue to recover ~{summary['recoverable_hours']} hours of approval chase time.",
-    )
-
-
 def render_bank_agent(kpis):
     bank_agent = kpis["agents"]["bank"]
     summary = bank_agent["summary"]
@@ -2894,10 +2987,7 @@ def render_bank_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">Bank Reconciliation Agent</div>
             <div class="entity-name">{summary['open_items']} open cash exceptions triaged</div>
-            <div class="entity-copy">
-                This agent groups bank exceptions by action bucket, proposes next steps, highlights draft journal candidates,
-                and isolates statement-level breaks that should block close sign-off.
-            </div>
+            <div class="entity-copy">Exception routing, ERP-ready drafts, and statement breaks in one queue.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3000,12 +3090,6 @@ def render_bank_agent(kpis):
             hide_index=True,
         )
 
-    render_ai_opportunity(
-        "AI Opportunity",
-        f"Auto-clear {summary['auto_clear_candidates']} timing items and post {summary['journal_candidates']} bank drafts once audit clears them.",
-    )
-
-
 def render_ic_agent(kpis):
     ic_agent = kpis["agents"]["ic"]
     summary = ic_agent["summary"]
@@ -3015,10 +3099,7 @@ def render_ic_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">Intercompany Agent</div>
             <div class="entity-name">{summary['auto_matched']} IC pairs auto-matched, {summary['open_exceptions']} still need elimination support</div>
-            <div class="entity-copy">
-                The IC agent auto-clears matched counterparties, isolates FX-driven mismatches, drafts elimination entries,
-                and pushes transfer-pricing or agreement issues into a separate compliance watchlist.
-            </div>
+            <div class="entity-copy">Auto-matching, FX mismatch resolution, elimination drafts, and TP watchlist coverage.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3129,12 +3210,6 @@ def render_ic_agent(kpis):
                 hide_index=True,
             )
 
-    render_ai_opportunity(
-        "AI Opportunity",
-        f"Post {summary['elimination_drafts']} elimination drafts and auto-clear {summary['auto_matched']} matched pairs to remove FX-driven consolidation noise.",
-    )
-
-
 def render_journal_agent(kpis):
     journal_agent = kpis["agents"]["journal"]
     summary = journal_agent["summary"]
@@ -3144,10 +3219,7 @@ def render_journal_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">Journal Entry Agent</div>
             <div class="entity-name">{summary['erp_ready_drafts']} draft JEs ready for ERP posting</div>
-            <div class="entity-copy">
-                The journal agent reads accrual support, applies standard reclassification rules, and appends an AI-style
-                audit trail to every candidate before deciding whether the draft is ERP-ready or still needs controller review.
-            </div>
+            <div class="entity-copy">Accrual drafting, standard reclasses, and audit-ready ERP posting drafts.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3241,12 +3313,6 @@ def render_journal_agent(kpis):
         hide_index=True,
     )
 
-    render_ai_opportunity(
-        "AI Opportunity",
-        f"Route {summary['erp_ready_drafts']} ERP-ready drafts into posting after audit, leaving only {summary['review_needed']} items for manual review.",
-    )
-
-
 def render_audit_agent(kpis):
     audit_agent = kpis["agents"]["audit"]
     summary = audit_agent["summary"]
@@ -3256,10 +3322,7 @@ def render_audit_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">Audit &amp; Compliance Agent</div>
             <div class="entity-name">{summary['ready_to_post']} drafts cleared for posting, {summary['blocked_for_review']} still blocked</div>
-            <div class="entity-copy">
-                This control gate reviews every ERP-ready draft JE from the Bank and Journal agents, scores control completeness,
-                assigns the required approver, and separates straight-through entries from drafts that still need audit or controller attention.
-            </div>
+            <div class="entity-copy">Control scoring, posting readiness, and exception gating before ERP release.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3360,12 +3423,6 @@ def render_audit_agent(kpis):
         hide_index=True,
     )
 
-    render_ai_opportunity(
-        "AI Opportunity",
-        f"Straight-through post {summary['ready_to_post']} drafts once the control score threshold is met and auto-hold the {summary['conditional_approval']} conditional items.",
-    )
-
-
 def render_flux_agent(kpis):
     flux_agent = kpis["agents"]["flux"]
     summary = flux_agent["summary"]
@@ -3375,10 +3432,7 @@ def render_flux_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">Flux Analysis Agent</div>
             <div class="entity-name">{summary['mom_anomalies']} MoM anomalies · {summary['yoy_anomalies']} YoY anomalies</div>
-            <div class="entity-copy">
-                This agent computes MoM and YoY movements, scans context cues from GL, accruals, and AP/AR notes, and drafts executive-ready commentary.
-                YoY comparisons are derived from a proxy baseline when prior-year data is not available.
-            </div>
+            <div class="entity-copy">Variance signals, contextual drivers, and executive-ready commentary.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3435,12 +3489,6 @@ def render_flux_agent(kpis):
         hide_index=True,
     )
 
-    render_ai_opportunity(
-        "AI Opportunity",
-        "Auto-generate MoM/YoY variance commentary for all flagged accounts and route the top three anomalies directly into the controller review pack.",
-    )
-
-
 def render_checklist_agent(kpis):
     checklist_agent = kpis["agents"]["checklist"]
     summary = checklist_agent["summary"]
@@ -3452,10 +3500,7 @@ def render_checklist_agent(kpis):
         <div class="entity-callout">
             <div class="section-label">Close Tracker</div>
             <div class="entity-name">{summary['blocked_tasks']} blocked, {summary['waiting_tasks']} waiting, {summary['critical_open_tasks']} critical still open</div>
-            <div class="entity-copy">
-                The close tracker turns the checklist into an unblock queue. It traces handoffs across reconciliation,
-                journals, and reporting so the team can remove dependency bottlenecks before they delay consolidation and reporting.
-            </div>
+            <div class="entity-copy">Critical-path handoffs, dependency blockers, and the next owner move.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3581,10 +3626,7 @@ def render_agents_hub(kpis):
         <div class="entity-callout">
             <div class="section-label">Agents</div>
             <div class="entity-name">Operational agents for approvals, reconciliations, journals, and controls</div>
-            <div class="entity-copy">
-                Use the sub-navigation below to move between the specialist agents without leaving the main navigation.
-                This keeps the top bar compact while preserving the full workflow across GL, bank, IC, journals, and audit.
-            </div>
+            <div class="entity-copy">Specialist views for the close areas that move forecast, readiness, and posting risk.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3614,9 +3656,7 @@ def render_agents_hub(kpis):
         render_flux_agent(kpis)
 
 
-def render_scenario_lab(kpis, score):
-    actions = build_scenario_actions(kpis)
-    recommendations = build_below_four_recommendations(kpis)
+def render_scenario_lab(kpis, score, actions, recommendations, plan_scenario):
     base_posting = kpis["agents"]["erp_posting"]
     if "applied_actions" not in st.session_state:
         st.session_state["applied_actions"] = set()
@@ -3630,17 +3670,13 @@ def render_scenario_lab(kpis, score):
         <div class="entity-callout">
             <div class="section-label">Scenario Lab</div>
             <div class="entity-name">{score['continuous_close_days']} day continuous forecast vs. {score['predicted_close_days']} day dashboard forecast</div>
-            <div class="entity-copy">
-                This simulator applies the agent actions already identified in the app and recomputes a continuous close-day forecast
-                so the team can see which bundles actually get NovaTech below the 4-day target.
-            </div>
+            <div class="entity-copy">Test the automation bundle and see which actions move the close below the 4-day target.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     plan_ids = [action["id"] for action in actions]
-    plan_scenario = simulate_close_scenario(kpis, plan_ids)
     delta_days = round(score["continuous_close_days"] - plan_scenario["score"]["continuous_close_days"], 1)
     posting = plan_scenario["posting_simulator"]
     automation_run = st.session_state.get("automation_run", False)
@@ -3787,9 +3823,7 @@ def render_priority_engine(priorities):
         <div class="entity-callout">
             <div class="section-label">Priority Engine</div>
             <div class="entity-name">{recoverable_hours} hours recoverable in the top four moves</div>
-            <div class="entity-copy">
-                The engine ranks work by operational impact, downstream unlock, and closeness to the CFO target.
-            </div>
+            <div class="entity-copy">Ordered by impact, downstream unlock, and closeness to the 4-day target.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3821,10 +3855,7 @@ def render_automation_plays():
         <div class="entity-callout">
             <div class="section-label">Automation Plays</div>
             <div class="entity-name">High-ROI automation ideas for the close</div>
-            <div class="entity-copy">
-                These plays sit below the immediate priority queue. They are the next layer of improvement once the
-                team has stabilized the current close and wants to reduce repeat manual effort month after month.
-            </div>
+            <div class="entity-copy">Next-wave opportunities once the current close is stable.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3938,7 +3969,7 @@ def render_app_header(kpis):
                 <div class="app-header-kicker">Month-End Workspace</div>
                 <div class="app-header-title">NovaClose</div>
                 <div class="app-header-copy">
-                    Current close dataset loaded and ready for review across risk, agents, and actions.
+                    AI month-end close command centre
                 </div>
             </div>
             """,
@@ -3980,14 +4011,16 @@ with st.sidebar:
 
 data, base_kpis, base_score, base_priorities, base_commentary = prepare(data_source)
 reset_copilot_if_needed(dataset_key_for(data_source), base_kpis, base_score, base_priorities)
+base_actions = get_cached_actions(base_kpis)
+base_recommendations = get_cached_recommendations(base_kpis)
+base_plan_scenario = get_cached_plan_scenario(base_kpis, [action["id"] for action in base_actions])
 
 with st.sidebar:
     st.markdown("### Accounting Period")
     st.write(base_kpis["summary"]["accounting_period_label"])
 
 if st.session_state.get("automation_run"):
-    automation_actions = build_scenario_actions(base_kpis)
-    applied = simulate_close_scenario(base_kpis, [action["id"] for action in automation_actions])
+    applied = get_cached_plan_scenario(base_kpis, [action["id"] for action in base_actions])
     kpis = applied["kpis"]
     score = applied["score"]
     priorities = priority_engine(kpis)
@@ -3999,6 +4032,8 @@ else:
     commentary = base_commentary
 
 render_app_header(kpis)
+current_actions = get_cached_actions(kpis)
+current_recommendations = get_cached_recommendations(kpis)
 
 nav_items = [
     "Command Centre",
@@ -4019,7 +4054,17 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(tab_order)
 tab_map = dict(zip(tab_order, [tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8]))
 
 with tab_map["Command Centre"]:
-    render_command_center(kpis, score, priorities, commentary)
+    render_command_center(
+        kpis,
+        score,
+        priorities,
+        commentary,
+        current_actions,
+        current_recommendations,
+        base_score,
+        base_plan_scenario["score"],
+        st.session_state.get("automation_run", False),
+    )
 
 with tab_map["Close Tracker"]:
     render_checklist_agent(kpis)
@@ -4032,7 +4077,7 @@ with tab_map["Risks"]:
     render_entity_view(kpis)
 
 with tab_map["Scenarios"]:
-    render_scenario_lab(base_kpis, base_score)
+    render_scenario_lab(base_kpis, base_score, base_actions, base_recommendations, base_plan_scenario)
 
 with tab_map["Priorities"]:
     render_priority_engine(priorities)
