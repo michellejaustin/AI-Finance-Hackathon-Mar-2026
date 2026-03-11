@@ -191,6 +191,7 @@ def apply_theme():
             --good: #2a9d8f;
             --warn: #e9a03b;
             --risk: #c75c5c;
+            --ai: #7353e5;
         }
 
         [data-testid="stAppViewContainer"] {
@@ -374,17 +375,15 @@ def apply_theme():
             color: var(--brand);
         }
 
-        .app-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
+        .app-header-main,
+        .app-header-meta {
             padding: 1rem 1.15rem;
             margin-bottom: 1rem;
             border-radius: 22px;
             background: linear-gradient(135deg, rgba(255, 255, 255, 0.92) 0%, rgba(244, 249, 252, 0.96) 100%);
             border: 1px solid rgba(15, 31, 44, 0.08);
             box-shadow: 0 14px 34px rgba(15, 31, 44, 0.06);
+            min-height: 118px;
         }
 
         .app-header-kicker {
@@ -415,6 +414,20 @@ def apply_theme():
             display: flex;
             align-items: center;
             justify-content: flex-end;
+            gap: 0.65rem;
+            flex-wrap: wrap;
+        }
+
+        .app-header-meta {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .app-header-meta-stack {
+            display: flex;
+            align-items: center;
+            justify-content: center;
             gap: 0.65rem;
             flex-wrap: wrap;
         }
@@ -458,18 +471,6 @@ def apply_theme():
             display: inline-block;
         }
 
-        .app-header .stButton > button {
-            width: 100%;
-            padding: 0.5rem 0.85rem;
-            border-radius: 12px;
-            border: 1px solid rgba(20, 54, 66, 0.2);
-            background: linear-gradient(135deg, #143642 0%, #256d85 100%);
-            color: #f8fbfc;
-            font-weight: 800;
-            font-size: 0.82rem;
-            white-space: nowrap;
-        }
-
         .hero-side-copy {
             margin-top: 0.55rem;
             color: var(--muted);
@@ -489,6 +490,12 @@ def apply_theme():
             border: 1px solid rgba(15, 31, 44, 0.08);
             padding: 0.75rem 0.9rem;
             box-shadow: 0 10px 26px rgba(15, 31, 44, 0.05);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            min-height: 132px;
         }
 
         .kpi-tile-label {
@@ -497,6 +504,7 @@ def apply_theme():
             font-size: 0.68rem;
             font-weight: 700;
             color: var(--muted);
+            text-align: center;
         }
 
         .kpi-tile-value {
@@ -506,11 +514,13 @@ def apply_theme():
             color: var(--brand);
             text-align: center;
             display: block;
+            width: 100%;
         }
 
         .kpi-tile-copy {
             font-size: 0.78rem;
             color: var(--muted);
+            text-align: center;
         }
 
         .kpi-tile-value.tone-risk {
@@ -523,6 +533,10 @@ def apply_theme():
 
         .kpi-tile-value.tone-good {
             color: var(--good);
+        }
+
+        .kpi-tile-value.tone-ai {
+            color: var(--ai);
         }
 
         .intel-band {
@@ -646,6 +660,12 @@ def apply_theme():
             font-weight: 700;
             color: var(--brand);
             margin-top: 0.4rem;
+        }
+
+        .focus-chip.done {
+            border-color: rgba(42, 157, 143, 0.24);
+            background: rgba(42, 157, 143, 0.14);
+            color: var(--good);
         }
 
         .queue-row {
@@ -1062,7 +1082,11 @@ def apply_theme():
         }
 
         .tracker-table-wrap {
+            position: relative;
+            max-height: 720px;
             overflow-x: auto;
+            overflow-y: auto;
+            background: #f8fbfc;
         }
 
         .tracker-table {
@@ -1072,6 +1096,9 @@ def apply_theme():
         }
 
         .tracker-table thead th {
+            position: sticky;
+            top: 0;
+            z-index: 6;
             text-align: left;
             padding: 0.78rem 0.7rem;
             font-size: 0.74rem;
@@ -1079,7 +1106,9 @@ def apply_theme():
             letter-spacing: 0.08em;
             color: var(--muted);
             border-bottom: 1px solid rgba(15, 31, 44, 0.10);
-            background: rgba(20, 54, 66, 0.04);
+            background: #eef3f6;
+            box-shadow: 0 2px 0 rgba(15, 31, 44, 0.08);
+            backdrop-filter: none;
         }
 
         .tracker-table tbody td {
@@ -1560,7 +1589,7 @@ def render_kpi_strip(summary):
 
     pending_tone = tone_class(pending_actions, warn_threshold=1, high_threshold=4, good_when_zero=True)
     risk_tone = tone_class(high_risk_items, warn_threshold=1, high_threshold=3, good_when_zero=True)
-    ai_tone = "tone-warn" if ai_candidates > 0 else "tone-good"
+    ai_tone = "tone-ai" if ai_candidates > 0 else "tone-good"
     if match_rate >= 90:
         match_tone = "tone-good"
     elif match_rate >= 80:
@@ -1750,7 +1779,7 @@ def render_me_steps(kpis, actions):
                     <div class="focus-item"><strong>Status:</strong> Data loaded and validated.</div>
                     <div class="focus-item">Dataset ready for close review.</div>
                 </div>
-                <span class="focus-chip">Complete</span>
+                <span class="focus-chip done">Complete</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1771,7 +1800,7 @@ def render_me_steps(kpis, actions):
         )
         if automation_run:
             st.button("Run all automations", key="me_run_all_disabled", use_container_width=True, disabled=True)
-            st.markdown("<span class='focus-chip'>Completed</span>", unsafe_allow_html=True)
+            st.markdown("<span class='focus-chip done'>Completed</span>", unsafe_allow_html=True)
         else:
             if st.button("Run all automations", key="me_run_all", use_container_width=True, type="primary"):
                 run_all_automations(kpis, actions)
@@ -3567,7 +3596,7 @@ def render_agents_hub(kpis):
             "Intercompany",
             "Journals",
             "Audit",
-            "Flux",
+            "Variance Analysis",
         ]
     )
 
@@ -3901,12 +3930,11 @@ def render_entity_view(kpis):
 
 def render_app_header(kpis):
     summary = kpis["summary"]
-    st.markdown("<div class='app-header'>", unsafe_allow_html=True)
-    left, right = st.columns([0.62, 0.38], gap="small")
+    left, middle, right = st.columns([0.58, 0.24, 0.18], gap="small")
     with left:
         st.markdown(
             """
-            <div>
+            <div class="app-header-main">
                 <div class="app-header-kicker">Month-End Workspace</div>
                 <div class="app-header-title">NovaClose</div>
                 <div class="app-header-copy">
@@ -3916,23 +3944,23 @@ def render_app_header(kpis):
             """,
             unsafe_allow_html=True,
         )
+    with middle:
+        st.markdown("<div class='app-header-meta'><div class='app-header-meta-stack'>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='status-pill'><span class='status-dot'></span>Live</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='period-pill'>Period: {summary['accounting_period_label']}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div></div>", unsafe_allow_html=True)
     with right:
-        status_col, period_col, ask_col = st.columns([0.28, 0.52, 0.2], gap="small")
-        with status_col:
-            st.markdown(
-                "<div class='status-pill'><span class='status-dot'></span>Live</div>",
-                unsafe_allow_html=True,
-            )
-        with period_col:
-            st.markdown(
-                f"<div class='period-pill'>Period: {summary['accounting_period_label']}</div>",
-                unsafe_allow_html=True,
-            )
-        with ask_col:
-            if st.button("Ask AI", key="ask_ai_button", use_container_width=True):
-                st.session_state["nav_target"] = "AI Copilot"
-                safe_rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div class='header-ask-ai'>", unsafe_allow_html=True)
+        if st.button("Ask AI", key="ask_ai_button", use_container_width=True, type="primary"):
+            st.session_state["nav_target"] = "AI Copilot"
+            safe_rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 apply_theme()
