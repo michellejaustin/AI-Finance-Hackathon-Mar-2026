@@ -77,6 +77,40 @@ def _format_currency(value):
     return f"EUR {value:,.0f}"
 
 
+def _derive_accounting_period(data):
+    period_candidates = []
+    for sheet_name in ("gl", "accruals", "ic"):
+        frame = data[sheet_name]
+        if "Period" in frame.columns:
+            period_candidates.extend(
+                frame["Period"].dropna().astype(str).str.strip().tolist()
+            )
+
+    normalized_periods = [value for value in period_candidates if value and value.lower() != "nan"]
+    if normalized_periods:
+        primary = pd.Series(normalized_periods).mode().iloc[0]
+        try:
+            period = pd.Period(primary, freq="M")
+            return {
+                "raw": primary,
+                "label": period.strftime("%b %Y"),
+            }
+        except Exception:
+            return {"raw": primary, "label": primary}
+
+    gl = data["gl"]
+    if "Posting Date" in gl.columns:
+        posting_dates = pd.to_datetime(gl["Posting Date"], errors="coerce").dropna()
+        if not posting_dates.empty:
+            latest = posting_dates.max().to_period("M")
+            return {
+                "raw": str(latest),
+                "label": latest.strftime("%b %Y"),
+            }
+
+    return {"raw": "Unknown", "label": "Unknown"}
+
+
 def _bank_offset_account(description, likely_cause):
     text = f"{description} {likely_cause}".lower()
     if "fx" in text or "foreign exchange" in text or "rounding" in text:
@@ -259,6 +293,263 @@ def _journal_agent_audit_trail(row, mapping, confidence):
     )
 
 
+def _is_blank(value):
+    return pd.isna(value) or str(value).strip() == "" or str(value).strip().lower() == "nan"
+
+
+def _audit_required_approver(source_agent, amount, recommendation):
+    if source_agent == "Bank Agent":
+        if recommendation == "Blocked for Review" or amount >= 50000:
+            return "Treasury Manager + Controller"
+        if amount >= 10000:
+            return "Treasury Manager"
+        return "Cash Controller"
+
+    if recommendation == "Blocked for Review" or amount >= 50000:
+        return "Controller + CFO"
+    if amount >= 20000:
+        return "Controller"
+    return "Accounting Manager"
+
+
+def _audit_agent_review(row):
+    journal_id = str(row.get("Journal ID", "Unassigned"))
+    source_agent = str(row.get("Source Agent", "Unknown"))
+    amount = abs(float(pd.to_numeric(row.get("Amount (EUR)"), errors="coerce") or 0))
+    confidence = int(pd.to_numeric(row.get("Confidence %"), errors="coerce") or 0)
+    support = "" if _is_blank(row.get("Support Pack")) else str(row.get("Support Pack"))
+    support_lower = support.lower()
+    control_gaps = []
+    blockers = []
+    score = 100
+
+    if _is_blank(row.get("Posting Date")):
+        score -= 12
+        blockers.append("Missing posting date")
+
+    if amount <= 0:
+        score -= 25
+        blockers.append("Invalid journal amount")
+
+    debit_account = row.get("Debit Account")
+    credit_account = row.get("Credit Account")
+    if _is_blank(debit_account) or _is_blank(credit_account):
+        score -= 25
+        blockers.append("Missing debit or credit account")
+    elif str(debit_account).strip() == str(credit_account).strip():
+        score -= 22
+        blockers.append("Debit and credit accounts are identical")
+
+    if _is_blank(row.get("Reference")):
+        score -= 8
+        control_gaps.append("Missing source reference")
+
+    if _is_blank(row.get("Header Text")):
+        score -= 5
+        control_gaps.append("Missing header text")
+
+    if _is_blank(row.get("Line Text")):
+        score -= 5
+        control_gaps.append("Missing line text")
+
+    if _is_blank(support) or "missing" in support_lower:
+        score -= 20
+        blockers.append("Missing support pack")
+    elif "estimate" in support_lower or "forecast" in support_lower:
+        score -= 12
+        control_gaps.append("Support is estimate-based")
+    elif "email" in support_lower:
+        score -= 6
+        control_gaps.append("Support is email-only")
+    elif "bank rec exception" in support_lower:
+        score -= 4
+        control_gaps.append("Support depends on reconciler notes")
+
+    if confidence < 70:
+        score -= 18
+        blockers.append("Confidence below control threshold")
+    elif confidence < 80:
+        score -= 10
+        control_gaps.append("Confidence below auto-post threshold")
+    elif confidence < 90:
+        score -= 4
+        control_gaps.append("Confidence below straight-through threshold")
+
+    if source_agent == "Journal Agent" and _is_blank(row.get("AI Audit Trail")):
+        score -= 8
+        control_gaps.append("Missing journal audit trail")
+
+    if amount >= 50000:
+        control_gaps.append("High-value JE requires secondary approval")
+
+    score = _clamp(score)
+    blocking_issues = blockers.copy()
+    if blockers or score < 70:
+        recommendation = "Blocked for Review"
+    elif score < 85 or amount >= 50000:
+        recommendation = "Conditional Approval"
+    else:
+        recommendation = "Ready to Post"
+
+    required_approver = _audit_required_approver(source_agent, amount, recommendation)
+    all_gaps = blockers + control_gaps
+    primary_gap = all_gaps[0] if all_gaps else "No material control gaps"
+    gaps_text = "; ".join(all_gaps) if all_gaps else "No material control gaps"
+    control_memo = (
+        f"Control review for {journal_id}: {source_agent} draft for {row.get('Entity', 'Unknown entity')} "
+        f"scored {score}/100. Recommendation: {recommendation}. "
+        f"Support basis: {support or 'Not provided'}. Required approver: {required_approver}. "
+        f"Key control observations: {gaps_text}. "
+        f"Reference {row.get('Reference', 'N/A')} for EUR {amount:,.2f}."
+    )
+
+    return {
+        "Control Score": score,
+        "Posting Recommendation": recommendation,
+        "Required Approver": required_approver,
+        "Primary Control Gap": primary_gap,
+        "Control Gaps": gaps_text,
+        "Blocking Issues": "; ".join(blocking_issues) if blocking_issues else "None",
+        "Control Memo": control_memo,
+    }
+
+
+def _dependency_step(value):
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "Step " in text:
+        text = text.split("Step ", 1)[1]
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def _count_open_downstream(step, children_by_step, open_steps, memo):
+    if step in memo:
+        return memo[step]
+
+    total = 0
+    for child in children_by_step.get(step, []):
+        if child in open_steps:
+            total += 1
+        total += _count_open_downstream(child, children_by_step, open_steps, memo)
+
+    memo[step] = total
+    return total
+
+
+def _ic_pair_label(row):
+    return f"{row['Sending Entity']} -> {row['Receiving Entity']}"
+
+
+def _ic_fx_flag(row):
+    status = str(row["Elimination Status"]).lower()
+    notes = str(row["Notes"]).lower() if pd.notna(row["Notes"]) else ""
+    difference = abs(float(pd.to_numeric(row["Difference (EUR)"], errors="coerce") or 0))
+    return difference > 0 and ("fx" in status or "fx" in notes)
+
+
+def _ic_primary_issue(row):
+    difference = float(pd.to_numeric(row["Difference (EUR)"], errors="coerce") or 0)
+    abs_difference = abs(difference)
+    tp_status = str(row["Transfer Pricing Compliant"])
+    agreement = str(row["Supporting Agreement"])
+    fx_flag = _ic_fx_flag(row)
+
+    if abs_difference > 0 and fx_flag:
+        return (
+            "FX mismatch",
+            "Generate FX elimination entry",
+            "Counterpart values are out of line because of an FX timing or rate difference.",
+            "Group Consolidation",
+            88,
+        )
+    if abs_difference > 0:
+        return (
+            "Elimination variance",
+            "Generate elimination entry",
+            "Counterpart amounts are mismatched and need a consolidating elimination adjustment.",
+            "Group Consolidation",
+            82,
+        )
+    if tp_status != "Yes":
+        return (
+            "Transfer pricing review",
+            "Escalate transfer pricing review",
+            "The IC transaction is matched, but transfer pricing is still under review.",
+            "Tax / Controller",
+            72,
+        )
+    if agreement == "Pending":
+        return (
+            "Agreement pending",
+            "Request supporting agreement",
+            "The values are matched, but the supporting intercompany agreement is still pending.",
+            "Legal / Controller",
+            76,
+        )
+    return (
+        "Auto-matched",
+        "Auto-clear matched pair",
+        "Sending and receiving amounts align, so the IC pair can clear without manual intervention.",
+        "IC Reconciler",
+        95,
+    )
+
+
+def _ic_elimination_draft(row, issue_type, owner, confidence):
+    difference = float(pd.to_numeric(row["Difference (EUR)"], errors="coerce") or 0)
+    abs_difference = abs(difference)
+    posting_date = _period_to_posting_date(row["Period"])
+    pair = _ic_pair_label(row)
+
+    if issue_type == "FX mismatch":
+        offset_code, offset_name = 8100, "Foreign Exchange Gain/Loss"
+        je_type = "FX Elimination Adjustment"
+    else:
+        offset_code, offset_name = 8200, "Intercompany Elimination Variance"
+        je_type = "IC Elimination Adjustment"
+
+    clearing_code, clearing_name = 1590, "Intercompany Clearing"
+    if difference >= 0:
+        debit_code, debit_name = offset_code, offset_name
+        credit_code, credit_name = clearing_code, clearing_name
+    else:
+        debit_code, debit_name = clearing_code, clearing_name
+        credit_code, credit_name = offset_code, offset_name
+
+    support_pack = (
+        f"{row['Supporting Agreement']} agreement + IC reconciliation notes"
+        if pd.notna(row["Supporting Agreement"])
+        else "IC reconciliation notes"
+    )
+
+    return {
+        "Journal ID": f"ICA-JE-{str(row['IC Transaction ID']).split('-')[-1]}",
+        "Source ID": row["IC Transaction ID"],
+        "Pair": pair,
+        "JE Type": je_type,
+        "Posting Date": posting_date,
+        "Currency": "EUR",
+        "Debit Account": debit_code,
+        "Debit Account Name": debit_name,
+        "Credit Account": credit_code,
+        "Credit Account Name": credit_name,
+        "Amount (EUR)": round(abs_difference, 2),
+        "Reference": row["IC Transaction ID"],
+        "Header Text": f"IC agent draft - {row['Transaction Type']} elimination",
+        "Line Text": f"{row['Transaction Type']} | {pair}",
+        "Support Pack": support_pack,
+        "Approval Status": "Draft - Ready for ERP",
+        "Confidence %": confidence,
+        "Owner": owner,
+    }
+
+
 def _build_journal_agent(accruals):
     candidate_mask = accruals["Status"].isin(["Pending Review", "Pending Approval", "Needs Documentation"])
     candidates = accruals.loc[candidate_mask].copy()
@@ -390,6 +681,505 @@ def _build_journal_agent(accruals):
         "audit_trails": audit_trails,
         "type_breakdown": type_breakdown,
         "entity_breakdown": entity_breakdown,
+    }
+
+
+def _build_audit_agent(bank_agent, ic_agent, journal_agent):
+    bank_drafts = bank_agent["erp_journal_drafts"].copy()
+    ic_drafts = ic_agent["erp_elimination_drafts"].copy()
+    journal_drafts = journal_agent["erp_journal_drafts"].copy()
+
+    if not bank_drafts.empty:
+        bank_drafts["Source Agent"] = "Bank Agent"
+        bank_drafts["JE Type"] = bank_drafts.get("JE Type", "Cash Clearing JE")
+        if "Source ID" not in bank_drafts.columns:
+            bank_drafts["Source ID"] = bank_drafts["Reference"]
+        if "AI Audit Trail" not in bank_drafts.columns:
+            bank_drafts["AI Audit Trail"] = ""
+
+    if not ic_drafts.empty:
+        ic_drafts["Source Agent"] = "IC Agent"
+        if "AI Audit Trail" not in ic_drafts.columns:
+            ic_drafts["AI Audit Trail"] = ""
+
+    if not journal_drafts.empty:
+        journal_drafts["Source Agent"] = "Journal Agent"
+
+    combined = pd.concat([bank_drafts, ic_drafts, journal_drafts], ignore_index=True, sort=False)
+    if combined.empty:
+        return {
+            "summary": {
+                "drafts_reviewed": 0,
+                "ready_to_post": 0,
+                "conditional_approval": 0,
+                "blocked_for_review": 0,
+                "average_control_score": 0,
+                "high_value_items": 0,
+                "control_memos_attached": 0,
+            },
+            "review_pack": pd.DataFrame(),
+            "exception_queue": pd.DataFrame(),
+            "status_breakdown": pd.DataFrame(columns=["Posting Recommendation", "Count"]),
+            "source_breakdown": pd.DataFrame(columns=["Source Agent", "Drafts"]),
+            "control_memos": pd.DataFrame(),
+        }
+
+    review_rows = []
+    for _, row in combined.iterrows():
+        review = _audit_agent_review(row)
+        review_rows.append(
+            {
+                "Journal ID": row.get("Journal ID"),
+                "Source Agent": row.get("Source Agent"),
+                "Source ID": row.get("Source ID"),
+                "Entity": row.get("Entity"),
+                "JE Type": row.get("JE Type", "Journal Entry"),
+                "Posting Date": row.get("Posting Date"),
+                "Currency": row.get("Currency", "EUR"),
+                "Amount (EUR)": float(pd.to_numeric(row.get("Amount (EUR)"), errors="coerce") or 0),
+                "Reference": row.get("Reference"),
+                "Support Pack": row.get("Support Pack"),
+                "Confidence %": int(pd.to_numeric(row.get("Confidence %"), errors="coerce") or 0),
+                "Debit Account": row.get("Debit Account"),
+                "Credit Account": row.get("Credit Account"),
+                "Header Text": row.get("Header Text"),
+                "Line Text": row.get("Line Text"),
+                "Approval Status": row.get("Approval Status"),
+                "Control Score": review["Control Score"],
+                "Posting Recommendation": review["Posting Recommendation"],
+                "Required Approver": review["Required Approver"],
+                "Primary Control Gap": review["Primary Control Gap"],
+                "Control Gaps": review["Control Gaps"],
+                "Blocking Issues": review["Blocking Issues"],
+                "Control Memo": review["Control Memo"],
+            }
+        )
+
+    review_pack = pd.DataFrame(review_rows)
+    status_order = {
+        "Blocked for Review": 2,
+        "Conditional Approval": 1,
+        "Ready to Post": 0,
+    }
+    review_pack["Status Rank"] = review_pack["Posting Recommendation"].map(status_order).fillna(0)
+    review_pack = review_pack.sort_values(
+        ["Status Rank", "Control Score", "Amount (EUR)"],
+        ascending=[False, True, False],
+    ).drop(columns=["Status Rank"])
+
+    exception_queue = review_pack.loc[
+        ~review_pack["Posting Recommendation"].eq("Ready to Post"),
+        [
+            "Journal ID",
+            "Source Agent",
+            "Entity",
+            "JE Type",
+            "Amount (EUR)",
+            "Control Score",
+            "Posting Recommendation",
+            "Required Approver",
+            "Primary Control Gap",
+            "Blocking Issues",
+        ],
+    ].copy()
+
+    status_breakdown = (
+        review_pack["Posting Recommendation"]
+        .value_counts()
+        .reindex(["Ready to Post", "Conditional Approval", "Blocked for Review"], fill_value=0)
+        .rename_axis("Posting Recommendation")
+        .reset_index(name="Count")
+    )
+    source_breakdown = (
+        review_pack.groupby("Source Agent")
+        .agg(
+            Drafts=("Journal ID", "count"),
+            Avg_Control_Score=("Control Score", "mean"),
+        )
+        .reset_index()
+    )
+    source_breakdown["Avg Control Score"] = source_breakdown["Avg_Control_Score"].round(1)
+    source_breakdown = source_breakdown.drop(columns=["Avg_Control_Score"])
+
+    control_memos = review_pack.loc[
+        :,
+        [
+            "Journal ID",
+            "Source Agent",
+            "Posting Recommendation",
+            "Control Score",
+            "Required Approver",
+            "Control Memo",
+        ],
+    ].copy()
+
+    summary = {
+        "drafts_reviewed": int(review_pack.shape[0]),
+        "ready_to_post": int(review_pack["Posting Recommendation"].eq("Ready to Post").sum()),
+        "conditional_approval": int(review_pack["Posting Recommendation"].eq("Conditional Approval").sum()),
+        "blocked_for_review": int(review_pack["Posting Recommendation"].eq("Blocked for Review").sum()),
+        "average_control_score": round(float(review_pack["Control Score"].mean()), 1),
+        "high_value_items": int(review_pack["Amount (EUR)"].ge(50000).sum()),
+        "control_memos_attached": int(control_memos.shape[0]),
+    }
+
+    return {
+        "summary": summary,
+        "review_pack": review_pack,
+        "exception_queue": exception_queue,
+        "status_breakdown": status_breakdown,
+        "source_breakdown": source_breakdown,
+        "control_memos": control_memos,
+    }
+
+
+def _build_checklist_agent(checklist):
+    frame = checklist.copy()
+    frame["Dependency Step"] = frame["Dependencies"].apply(_dependency_step)
+    open_mask = ~frame["Status"].eq("Completed")
+    open_tasks = frame.loc[open_mask].copy()
+
+    if open_tasks.empty:
+        return {
+            "summary": {
+                "blocked_tasks": 0,
+                "waiting_tasks": 0,
+                "critical_open_tasks": 0,
+                "handoffs_at_risk": 0,
+                "recoverable_hours": 0,
+                "automation_candidates": 0,
+            },
+            "worklist": pd.DataFrame(),
+            "critical_path": pd.DataFrame(),
+            "handoff_queue": pd.DataFrame(),
+            "action_breakdown": pd.DataFrame(columns=["Action Lane", "Count"]),
+            "category_breakdown": pd.DataFrame(columns=["Category", "Open Tasks", "Hours at Risk"]),
+        }
+
+    step_lookup = frame.set_index("Step")[
+        ["Task", "Status", "Owner / Responsible", "Priority", "Category"]
+    ].to_dict(orient="index")
+    children_by_step = {}
+    for _, row in frame.dropna(subset=["Dependency Step"]).iterrows():
+        children_by_step.setdefault(int(row["Dependency Step"]), []).append(int(row["Step"]))
+
+    open_steps = set(open_tasks["Step"].astype(int).tolist())
+    memo = {}
+    records = []
+
+    for _, row in open_tasks.iterrows():
+        step = int(row["Step"])
+        dependency_step = row["Dependency Step"]
+        dependency_record = step_lookup.get(int(dependency_step), {}) if pd.notna(dependency_step) else {}
+        dependency_task = dependency_record.get("Task", "No upstream dependency")
+        dependency_status = dependency_record.get("Status", "Ready")
+        dependency_owner = dependency_record.get("Owner / Responsible", "N/A")
+        downstream_open = _count_open_downstream(step, children_by_step, open_steps, memo)
+
+        status = str(row["Status"])
+        priority = str(row["Priority"])
+        owner = str(row["Owner / Responsible"])
+        estimated_hours = float(pd.to_numeric(row["Estimated Hours"], errors="coerce") or 0)
+        automation_potential = str(row["Automation Potential"])
+        notes = str(row["Notes"]) if pd.notna(row["Notes"]) else ""
+
+        status_weight = {
+            "Blocked": 5,
+            "Waiting on Input": 4,
+            "Not Started": 3,
+            "In Progress": 2,
+        }.get(status, 1)
+        priority_weight = {"Critical": 5, "High": 3, "Medium": 2, "Low": 1}.get(priority, 1)
+        unblock_score = _clamp((status_weight * 10) + (priority_weight * 8) + min(downstream_open * 6, 24) + min(estimated_hours, 8))
+
+        if status == "Blocked":
+            action_lane = "Escalate owner"
+            next_action = f"Escalate {owner} and clear the dependency handoff from {dependency_owner}."
+        elif status == "Waiting on Input":
+            if dependency_task == "No upstream dependency":
+                action_lane = "Chase external input"
+                next_action = f"Obtain the missing external confirmation so {owner} can resume and release downstream steps."
+            else:
+                action_lane = "Chase dependency"
+                next_action = f"Obtain the missing handoff from {dependency_owner} so {owner} can resume."
+        elif priority == "Critical" and status == "Not Started":
+            action_lane = "Start in parallel"
+            next_action = f"Pre-stage support with {owner} and begin parallel prep before the upstream task fully closes."
+        elif priority == "Critical" and status == "In Progress":
+            action_lane = "Protect same-day completion"
+            next_action = f"Keep {owner} on the critical path and hand off immediately to downstream teams."
+        else:
+            action_lane = "Monitor"
+            next_action = f"Keep {owner} on schedule and confirm the next dependency stays on track."
+
+        records.append(
+            {
+                "Step": step,
+                "Category": row["Category"],
+                "Task": row["Task"],
+                "Owner": owner,
+                "Deadline": row["Deadline"],
+                "Status": status,
+                "Priority": priority,
+                "Dependency Task": dependency_task,
+                "Dependency Status": dependency_status,
+                "Dependency Owner": dependency_owner,
+                "Downstream Open Tasks": downstream_open,
+                "Estimated Hours": round(estimated_hours, 2),
+                "Automation Potential": automation_potential,
+                "Tool / System": row["Tool / System"],
+                "Action Lane": action_lane,
+                "Next Action": next_action,
+                "Unblock Score": unblock_score,
+                "Notes": notes or "No additional note",
+            }
+        )
+
+    worklist = pd.DataFrame(records).sort_values(
+        ["Unblock Score", "Estimated Hours"],
+        ascending=[False, False],
+    )
+    critical_path = worklist.loc[
+        worklist["Priority"].eq("Critical"),
+        [
+            "Step",
+            "Category",
+            "Task",
+            "Status",
+            "Owner",
+            "Dependency Task",
+            "Downstream Open Tasks",
+            "Estimated Hours",
+            "Action Lane",
+            "Next Action",
+            "Unblock Score",
+        ],
+    ].copy()
+    handoff_queue = worklist.loc[
+        worklist["Status"].isin(["Blocked", "Waiting on Input"]),
+        [
+            "Step",
+            "Category",
+            "Task",
+            "Status",
+            "Priority",
+            "Owner",
+            "Dependency Task",
+            "Dependency Status",
+            "Dependency Owner",
+            "Estimated Hours",
+            "Action Lane",
+            "Next Action",
+            "Unblock Score",
+        ],
+    ].copy()
+    action_breakdown = (
+        worklist["Action Lane"].value_counts().rename_axis("Action Lane").reset_index(name="Count")
+    )
+    category_breakdown = (
+        worklist.groupby("Category")
+        .agg(
+            **{
+                "Open Tasks": ("Task", "count"),
+                "Hours at Risk": ("Estimated Hours", "sum"),
+            }
+        )
+        .reset_index()
+        .sort_values(["Hours at Risk", "Open Tasks"], ascending=[False, False])
+    )
+    category_breakdown["Hours at Risk"] = category_breakdown["Hours at Risk"].round(1)
+
+    waiting_or_blocked = worklist["Status"].isin(["Blocked", "Waiting on Input"])
+    critical_open = worklist["Priority"].eq("Critical")
+    recoverable_hours = int(
+        round(
+            worklist.loc[waiting_or_blocked, "Estimated Hours"].max()
+            if waiting_or_blocked.any()
+            else worklist["Estimated Hours"].head(1).max()
+        )
+    )
+
+    automation_candidates = int(
+        worklist["Automation Potential"].astype(str).str.contains("High|AI candidate", case=False, na=False).sum()
+    )
+    dependency_summary = {
+        "external_inputs": int(worklist["Dependency Task"].eq("No upstream dependency").sum()),
+        "upstream_in_progress": int(worklist["Dependency Status"].eq("In Progress").sum()),
+        "upstream_not_started": int(worklist["Dependency Status"].eq("Not Started").sum()),
+        "upstream_waiting": int(worklist["Dependency Status"].eq("Waiting on Input").sum()),
+        "completed_handoffs_open": int(worklist["Dependency Status"].eq("Completed").sum()),
+    }
+
+    summary = {
+        "blocked_tasks": int(worklist["Status"].eq("Blocked").sum()),
+        "waiting_tasks": int(worklist["Status"].eq("Waiting on Input").sum()),
+        "critical_open_tasks": int(critical_open.sum()),
+        "handoffs_at_risk": int(
+            worklist.loc[waiting_or_blocked | critical_open, "Dependency Task"].ne("No upstream dependency").sum()
+        ),
+        "recoverable_hours": recoverable_hours,
+        "automation_candidates": automation_candidates,
+    }
+
+    return {
+        "summary": summary,
+        "dependency_summary": dependency_summary,
+        "worklist": worklist,
+        "critical_path": critical_path,
+        "handoff_queue": handoff_queue,
+        "action_breakdown": action_breakdown,
+        "category_breakdown": category_breakdown,
+    }
+
+
+def _build_ic_agent(ic):
+    frame = ic.copy()
+    if frame.empty:
+        return {
+            "summary": {
+                "total_pairs": 0,
+                "auto_matched": 0,
+                "open_exceptions": 0,
+                "fx_mismatches": 0,
+                "elimination_drafts": 0,
+                "tp_flags": 0,
+                "pending_agreements": 0,
+                "unresolved_difference": 0.0,
+            },
+            "worklist": pd.DataFrame(),
+            "issue_breakdown": pd.DataFrame(columns=["Issue Type", "Count"]),
+            "pair_breakdown": pd.DataFrame(columns=["Pair", "Open Items", "Unresolved Difference (EUR)"]),
+            "erp_elimination_drafts": pd.DataFrame(),
+            "tp_watchlist": pd.DataFrame(),
+            "auto_matches": pd.DataFrame(),
+        }
+
+    records = []
+    draft_rows = []
+
+    for _, row in frame.iterrows():
+        pair = _ic_pair_label(row)
+        issue_type, recommended_action, likely_cause, owner, confidence = _ic_primary_issue(row)
+        difference = float(pd.to_numeric(row["Difference (EUR)"], errors="coerce") or 0)
+        abs_difference = abs(difference)
+        tp_status = str(row["Transfer Pricing Compliant"])
+        agreement = str(row["Supporting Agreement"])
+        fx_flag = _ic_fx_flag(row)
+        open_exception = abs_difference > 0
+        tp_flag = tp_status != "Yes" or agreement == "Pending"
+        match_outcome = "Auto-matched" if abs_difference == 0 else "Exception"
+
+        records.append(
+            {
+                "IC Transaction ID": row["IC Transaction ID"],
+                "Pair": pair,
+                "Transaction Type": row["Transaction Type"],
+                "Match Outcome": match_outcome,
+                "Issue Type": issue_type,
+                "Currency": row["Currency"],
+                "Sending Amount (EUR)": float(pd.to_numeric(row["Sending Amount (EUR)"], errors="coerce") or 0),
+                "Receiving Amount (EUR)": float(pd.to_numeric(row["Receiving Amount (EUR)"], errors="coerce") or 0),
+                "Difference (EUR)": round(difference, 2),
+                "Elimination Status": row["Elimination Status"],
+                "FX Flag": "Yes" if fx_flag else "No",
+                "Transfer Pricing": tp_status,
+                "Supporting Agreement": agreement,
+                "Reconciler": row["Reconciler"],
+                "Recommended Action": recommended_action,
+                "Likely Cause": likely_cause,
+                "Owner": owner,
+                "Confidence %": confidence,
+            }
+        )
+
+        if open_exception:
+            draft_rows.append(_ic_elimination_draft(row, issue_type, owner, confidence))
+
+    all_rows = pd.DataFrame(records)
+    worklist = all_rows.loc[
+        all_rows["Issue Type"].ne("Auto-matched"),
+        :,
+    ].copy()
+    issue_rank = {
+        "FX mismatch": 4,
+        "Elimination variance": 3,
+        "Transfer pricing review": 2,
+        "Agreement pending": 1,
+    }
+    if not worklist.empty:
+        worklist["Issue Rank"] = worklist["Issue Type"].map(issue_rank).fillna(0)
+        worklist = worklist.sort_values(
+            ["Issue Rank", "Difference (EUR)", "Confidence %"],
+            ascending=[False, False, False],
+        ).drop(columns=["Issue Rank"])
+
+    erp_elimination_drafts = pd.DataFrame(draft_rows)
+    auto_matches = all_rows.loc[
+        all_rows["Match Outcome"].eq("Auto-matched"),
+        [
+            "IC Transaction ID",
+            "Pair",
+            "Transaction Type",
+            "Currency",
+            "Transfer Pricing",
+            "Supporting Agreement",
+            "Recommended Action",
+            "Confidence %",
+        ],
+    ].copy()
+    issue_breakdown = (
+        worklist["Issue Type"].value_counts().rename_axis("Issue Type").reset_index(name="Count")
+        if not worklist.empty
+        else pd.DataFrame(columns=["Issue Type", "Count"])
+    )
+    pair_breakdown = (
+        worklist.groupby("Pair")
+        .agg(
+            **{
+                "Open Items": ("IC Transaction ID", "count"),
+                "Unresolved Difference (EUR)": ("Difference (EUR)", lambda s: round(s.abs().sum(), 2)),
+                "FX Flags": ("FX Flag", lambda s: int((s == "Yes").sum())),
+                "TP Flags": ("Transfer Pricing", lambda s: int((s != "Yes").sum())),
+            }
+        )
+        .reset_index()
+        .sort_values(["Unresolved Difference (EUR)", "Open Items"], ascending=[False, False])
+        if not worklist.empty
+        else pd.DataFrame(columns=["Pair", "Open Items", "Unresolved Difference (EUR)", "FX Flags", "TP Flags"])
+    )
+    tp_watchlist = all_rows.loc[
+        all_rows["Transfer Pricing"].ne("Yes") | all_rows["Supporting Agreement"].eq("Pending"),
+        [
+            "IC Transaction ID",
+            "Pair",
+            "Transaction Type",
+            "Transfer Pricing",
+            "Supporting Agreement",
+            "Recommended Action",
+            "Owner",
+            "Confidence %",
+        ],
+    ].copy()
+
+    summary = {
+        "total_pairs": int(frame.shape[0]),
+        "auto_matched": int(all_rows["Match Outcome"].eq("Auto-matched").sum()),
+        "open_exceptions": int(all_rows["Match Outcome"].eq("Exception").sum()),
+        "fx_mismatches": int(all_rows["FX Flag"].eq("Yes").sum()),
+        "elimination_drafts": int(erp_elimination_drafts.shape[0]),
+        "tp_flags": int(tp_watchlist.shape[0]),
+        "pending_agreements": int(all_rows["Supporting Agreement"].eq("Pending").sum()),
+        "unresolved_difference": round(float(all_rows["Difference (EUR)"].abs().sum()), 2),
+    }
+
+    return {
+        "summary": summary,
+        "worklist": worklist,
+        "issue_breakdown": issue_breakdown,
+        "pair_breakdown": pair_breakdown,
+        "erp_elimination_drafts": erp_elimination_drafts,
+        "tp_watchlist": tp_watchlist,
+        "auto_matches": auto_matches,
     }
 
 
@@ -805,6 +1595,7 @@ def calculate_kpis(data):
     fa = data["fa"].copy()
     apar = data["apar"].copy()
     checklist = data["checklist"].copy()
+    accounting_period = _derive_accounting_period(data)
 
     gl["Entry Amount (EUR)"] = gl[["Debit (EUR)", "Credit (EUR)"]].max(axis=1)
     tb["variance_pct_num"] = pd.to_numeric(
@@ -831,8 +1622,11 @@ def calculate_kpis(data):
     bank_exception_breakdown = (
         bank.loc[bank_exception_mask, "Match Status"].value_counts().sort_values(ascending=False).to_dict()
     )
+    ic_agent = _build_ic_agent(ic)
     bank_agent = _build_bank_agent(bank)
     journal_agent = _build_journal_agent(accruals)
+    audit_agent = _build_audit_agent(bank_agent, ic_agent, journal_agent)
+    checklist_agent = _build_checklist_agent(checklist)
 
     ic_exception_mask = ~ic["Elimination Status"].eq("Eliminated")
     ic_exceptions = int(ic_exception_mask.sum())
@@ -1096,6 +1890,8 @@ def calculate_kpis(data):
     }
 
     summary = {
+        "accounting_period": accounting_period["raw"],
+        "accounting_period_label": accounting_period["label"],
         "pending_gl": pending_gl,
         "manual_jes": manual_jes,
         "posted_jes": posted_jes,
@@ -1107,8 +1903,20 @@ def calculate_kpis(data):
         "bank_escalations": bank_agent["summary"]["escalations"],
         "bank_manual_investigations": bank_agent["summary"]["manual_investigations"],
         "bank_statement_break_value": round(bank_agent["summary"]["statement_break_value"], 2),
+        "ic_auto_matched": ic_agent["summary"]["auto_matched"],
+        "ic_fx_mismatches": ic_agent["summary"]["fx_mismatches"],
+        "ic_elimination_drafts": ic_agent["summary"]["elimination_drafts"],
+        "ic_tp_flags": ic_agent["summary"]["tp_flags"],
         "journal_agent_ready_drafts": journal_agent["summary"]["erp_ready_drafts"],
         "journal_agent_review_needed": journal_agent["summary"]["review_needed"],
+        "audit_drafts_reviewed": audit_agent["summary"]["drafts_reviewed"],
+        "audit_ready_to_post": audit_agent["summary"]["ready_to_post"],
+        "audit_conditional": audit_agent["summary"]["conditional_approval"],
+        "audit_blocked": audit_agent["summary"]["blocked_for_review"],
+        "audit_avg_control_score": audit_agent["summary"]["average_control_score"],
+        "checklist_handoffs_at_risk": checklist_agent["summary"]["handoffs_at_risk"],
+        "checklist_recoverable_hours": checklist_agent["summary"]["recoverable_hours"],
+        "checklist_automation_candidates": checklist_agent["summary"]["automation_candidates"],
         "ic_exceptions": ic_exceptions,
         "ic_total_diff": round(ic_total_diff, 2),
         "accrual_risks": accrual_risks,
@@ -1144,7 +1952,10 @@ def calculate_kpis(data):
         "details": details,
         "agents": {
             "bank": bank_agent,
+            "ic": ic_agent,
             "journal": journal_agent,
+            "audit": audit_agent,
+            "checklist": checklist_agent,
         },
     }
 
@@ -1284,7 +2095,7 @@ def priority_engine(kpis):
             "Unblock critical close checklist tasks",
             f"{summary['blocked_tasks']} tasks are blocked, {summary['waiting_tasks']} are waiting on input, and {summary['critical_open_tasks']} critical items remain open.",
             "Removes dependency bottlenecks across reporting and reconciliation.",
-            7,
+            summary.get("checklist_recoverable_hours", 7),
             8,
             "Critical checklist handoffs across reconciliation, journals, and reporting",
         )
@@ -1364,14 +2175,52 @@ def _route_copilot_intent(prompt):
 
     if any(keyword in text for keyword in ["bank agent", "bank reconciliation agent", "bank rec agent", "cash agent"]):
         return "bank_agent"
+    if any(
+        keyword in text
+        for keyword in [
+            "ic agent",
+            "intercompany agent",
+            "intercompany reconciliation",
+            "intercompany",
+            "fx mismatch",
+            "transfer pricing",
+        ]
+    ):
+        return "ic_agent"
     if any(keyword in text for keyword in ["journal agent", "je agent", "journal entry agent", "what should the journal agent post"]):
         return "journal_agent"
+    if any(
+        keyword in text
+        for keyword in [
+            "checklist agent",
+            "close checklist",
+            "checklist tasks",
+            "unblocked",
+            "unblock",
+            "unblock critical tasks",
+            "waiting on input",
+            "handoff",
+        ]
+    ):
+        return "checklist_agent"
+    if any(keyword in text for keyword in ["controller", "today", "fix first", "do today", "priority today"]):
+        return "controller_actions"
+    if any(
+        keyword in text
+        for keyword in [
+            "audit",
+            "compliance",
+            "controls",
+            "before posting",
+            "what does audit need to review",
+            "control completeness",
+        ]
+    ):
+        return "audit_agent"
     if any(keyword in text for keyword in ["riskiest entity", "which entity", "entity risk", "entity is riskiest"]):
         return "riskiest_entity"
     if any(keyword in text for keyword in ["variance", "trial balance", "tb"]):
         return "tb_variances"
-    if any(keyword in text for keyword in ["controller", "today", "fix first", "do today", "priority today"]):
-        return "controller_actions"
     if any(keyword in text for keyword in ["automate", "automation", "auto", "automated"]):
         return "automation_opportunities"
     if any(keyword in text for keyword in ["cfo", "executive", "summary", "board"]):
@@ -1386,7 +2235,10 @@ def generate_copilot_response(prompt, kpis, score, priorities):
     entities = kpis["entities"]
     details = kpis["details"]
     bank_agent = kpis["agents"]["bank"]
+    ic_agent = kpis["agents"]["ic"]
     journal_agent = kpis["agents"]["journal"]
+    audit_agent = kpis["agents"]["audit"]
+    checklist_agent = kpis["agents"]["checklist"]
     top_priorities = priorities[:3]
     top_entity = entities[0] if entities else None
     top_variances = details["tb_variances"].head(3)
@@ -1395,7 +2247,10 @@ def generate_copilot_response(prompt, kpis, score, priorities):
     follow_ups = [
         "What issues will delay the close?",
         "What should the bank agent do next?",
+        "What should the IC agent do next?",
         "What should the journal agent post?",
+        "What checklist tasks need to be unblocked?",
+        "What does audit need to review before posting?",
         "What should the controller do today?",
         "Which entity is riskiest?",
         "Explain the biggest variances.",
@@ -1501,6 +2356,26 @@ def generate_copilot_response(prompt, kpis, score, priorities):
             f"{bank_agent['summary']['escalations']} escalations",
             f"{bank_agent['summary']['manual_investigations']} manual investigations",
         ]
+    elif intent == "ic_agent":
+        worklist = ic_agent["worklist"].head(3)
+        action_lines = [
+            f"- {row['IC Transaction ID']}: {row['Pair']} | {row['Issue Type']} | {row['Recommended Action']}"
+            for _, row in worklist.iterrows()
+        ]
+        answer = (
+            f"The intercompany agent has auto-matched {ic_agent['summary']['auto_matched']} of {ic_agent['summary']['total_pairs']} IC pairs. "
+            f"It sees {ic_agent['summary']['open_exceptions']} open reconciliation exceptions, "
+            f"{ic_agent['summary']['fx_mismatches']} FX-driven mismatches, "
+            f"{ic_agent['summary']['elimination_drafts']} elimination entries ready to draft, and "
+            f"{ic_agent['summary']['tp_flags']} transfer-pricing or agreement flags.\n\n"
+            + "\n".join(action_lines)
+        )
+        source_metrics = [
+            f"{ic_agent['summary']['auto_matched']} auto-matched",
+            f"{ic_agent['summary']['open_exceptions']} open IC exceptions",
+            f"{ic_agent['summary']['fx_mismatches']} FX mismatches",
+            f"{ic_agent['summary']['tp_flags']} TP/agreement flags",
+        ]
     elif intent == "journal_agent":
         drafts = journal_agent["erp_journal_drafts"].head(3)
         draft_lines = [
@@ -1520,10 +2395,50 @@ def generate_copilot_response(prompt, kpis, score, priorities):
             f"{journal_agent['summary']['standard_reclasses']} reclasses",
             f"{journal_agent['summary']['audit_trails_attached']} audit trails",
         ]
+    elif intent == "audit_agent":
+        review_items = audit_agent["exception_queue"].head(3)
+        review_lines = [
+            f"- {row['Journal ID']}: {row['Posting Recommendation']} | {row['Primary Control Gap']} | {row['Required Approver']}"
+            for _, row in review_items.iterrows()
+        ]
+        answer = (
+            f"The audit and compliance agent reviewed {audit_agent['summary']['drafts_reviewed']} ERP-ready journal drafts. "
+            f"{audit_agent['summary']['ready_to_post']} are ready to post, "
+            f"{audit_agent['summary']['conditional_approval']} need conditional approval, and "
+            f"{audit_agent['summary']['blocked_for_review']} are blocked for review. "
+            f"The average control completeness score is {audit_agent['summary']['average_control_score']}/100.\n\n"
+            + ("\n".join(review_lines) if review_lines else "No additional control exceptions are open.")
+        )
+        source_metrics = [
+            f"{audit_agent['summary']['ready_to_post']} ready to post",
+            f"{audit_agent['summary']['conditional_approval']} conditional",
+            f"{audit_agent['summary']['blocked_for_review']} blocked",
+            f"{audit_agent['summary']['average_control_score']}/100 avg score",
+        ]
+    elif intent == "checklist_agent":
+        handoffs = checklist_agent["handoff_queue"].head(3)
+        handoff_lines = [
+            f"- Step {row['Step']}: {row['Task']} | {row['Status']} | {row['Action Lane']}"
+            for _, row in handoffs.iterrows()
+        ]
+        answer = (
+            f"The checklist agent is focused on {checklist_agent['summary']['blocked_tasks']} blocked tasks, "
+            f"{checklist_agent['summary']['waiting_tasks']} waiting-on-input tasks, and "
+            f"{checklist_agent['summary']['critical_open_tasks']} critical tasks still open. "
+            f"It sees {checklist_agent['summary']['handoffs_at_risk']} dependency handoffs at risk and "
+            f"{checklist_agent['summary']['recoverable_hours']} recoverable hours if the team clears the top bottlenecks first.\n\n"
+            + ("\n".join(handoff_lines) if handoff_lines else "No checklist bottlenecks are currently queued.")
+        )
+        source_metrics = [
+            f"{checklist_agent['summary']['blocked_tasks']} blocked",
+            f"{checklist_agent['summary']['waiting_tasks']} waiting",
+            f"{checklist_agent['summary']['critical_open_tasks']} critical open",
+            f"{checklist_agent['summary']['recoverable_hours']} hrs recoverable",
+        ]
     else:
         answer = (
             "NovaClose Copilot is optimized for close blockers, today’s controller actions, automation opportunities, "
-            "bank reconciliation triage, journal drafting, riskiest entity analysis, and trial balance variance summaries. Start with one of those questions and I’ll answer using the dataset already loaded into the app."
+            "bank reconciliation triage, journal drafting, checklist unblocking, audit review, riskiest entity analysis, and trial balance variance summaries. Start with one of those questions and I’ll answer using the dataset already loaded into the app."
         )
         source_metrics = [
             f"{summary['pending_gl']} pending GL",
