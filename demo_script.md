@@ -1,4 +1,4 @@
-# NovaClose AI Demo Script
+# NovaClose Demo Script
 
 ## 1. Opening line
 
@@ -14,7 +14,7 @@ Lead with the copilot and the readiness gauge.
 
 Say:
 
-- "This is NovaClose AI, our month-end close intelligence layer."
+- "This is NovaClose, our month-end close intelligence layer."
 - "It gives finance a live readiness score, predicted close days, and a ranked view of what will delay the close."
 - "The current demo projects a 4.4-day close, which is 0.4 days above target."
 
@@ -108,7 +108,7 @@ Call out:
 
 Use this line:
 
-"NovaClose AI moves NovaTech from reactive close management to predictive close intelligence. Instead of finding problems on day 5 or 6, finance can detect blockers immediately, prioritize work, and shorten the path to target."
+"NovaClose moves NovaTech from reactive close management to predictive close intelligence. Instead of finding problems on day 5 or 6, finance can detect blockers immediately, prioritize work, and shorten the path to target."
 
 ## 11. Quantified closeout
 

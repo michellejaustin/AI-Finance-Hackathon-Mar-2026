@@ -1,4 +1,5 @@
 from html import escape
+from itertools import combinations
 from pathlib import Path
 from textwrap import dedent
 
@@ -15,16 +16,18 @@ except ModuleNotFoundError:
 
 from novaclose_analysis import (
     AREA_LABELS,
+    build_scenario_actions,
     calculate_kpis,
     calculate_readiness_score,
     generate_commentary,
     generate_copilot_response,
     load_data,
     priority_engine,
+    simulate_close_scenario,
 )
 
 st.set_page_config(
-    page_title="NovaClose AI",
+    page_title="NovaClose",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -43,14 +46,17 @@ DETAIL_MAP = {
 }
 QUICK_PROMPTS = [
     "What issues will delay the close?",
+    "What should the GL approval agent do next?",
+    "What can auto-post to ERP?",
     "What should the bank agent do next?",
     "What should the IC agent do next?",
     "What should the journal agent post?",
+    "What gets us below 4 days?",
     "What checklist tasks need to be unblocked?",
     "What does audit need to review before posting?",
     "What should the controller do today?",
     "Which entity is riskiest?",
-    "Explain the biggest variances.",
+    "Explain MoM / YoY variances.",
 ]
 
 
@@ -66,6 +72,16 @@ def prepare(path):
     priorities = priority_engine(kpis)
     commentary = generate_commentary(kpis, score)
     return data, kpis, score, priorities, commentary
+
+
+def safe_rerun():
+    rerun_fn = getattr(st, "rerun", None)
+    if callable(rerun_fn):
+        rerun_fn()
+        return
+    rerun_fn = getattr(st, "experimental_rerun", None)
+    if callable(rerun_fn):
+        rerun_fn()
 
 
 def apply_theme():
@@ -150,14 +166,16 @@ def apply_theme():
         }
 
         [data-testid="stTabs"] [role="tablist"] {
-            gap: 0.45rem;
-            padding: 0.45rem;
-            margin-bottom: 1.35rem;
+            gap: 0.25rem;
+            padding: 0.32rem;
+            margin-bottom: 1rem;
             border: 1px solid rgba(20, 54, 66, 0.12);
             border-radius: 22px;
             background: rgba(255, 255, 255, 0.74);
             box-shadow: 0 16px 40px rgba(15, 31, 44, 0.06);
             backdrop-filter: blur(10px);
+            flex-wrap: nowrap;
+            justify-content: space-between;
         }
 
         [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
@@ -166,8 +184,10 @@ def apply_theme():
 
         [data-testid="stTabs"] [role="tab"] {
             height: auto;
-            padding: 0.72rem 1rem;
-            border-radius: 16px;
+            flex: 1 1 0;
+            min-width: 0;
+            padding: 0.56rem 0.62rem;
+            border-radius: 14px;
             border: none !important;
             background: transparent;
             color: var(--muted) !important;
@@ -177,9 +197,10 @@ def apply_theme():
 
         [data-testid="stTabs"] [role="tab"] p {
             margin: 0;
-            font-size: 1rem;
+            font-size: 0.87rem;
             font-weight: 700;
             color: inherit !important;
+            white-space: nowrap;
         }
 
         [data-testid="stTabs"] [role="tab"]:hover {
@@ -192,6 +213,7 @@ def apply_theme():
             color: #f8fbfc !important;
             box-shadow: 0 12px 24px rgba(20, 54, 66, 0.22);
         }
+
 
         .hero {
             background: linear-gradient(135deg, rgba(20, 54, 66, 0.97) 0%, rgba(37, 109, 133, 0.95) 58%, rgba(236, 242, 246, 0.95) 58%);
@@ -322,10 +344,219 @@ def apply_theme():
             white-space: nowrap;
         }
 
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.4rem 0.75rem;
+            border-radius: 999px;
+            border: 1px solid rgba(42, 157, 143, 0.25);
+            background: rgba(42, 157, 143, 0.12);
+            color: #1f7f75;
+            font-size: 0.72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #2a9d8f;
+            display: inline-block;
+        }
+
+        .app-header .stButton > button {
+            width: 100%;
+            padding: 0.5rem 0.85rem;
+            border-radius: 12px;
+            border: 1px solid rgba(20, 54, 66, 0.2);
+            background: linear-gradient(135deg, #143642 0%, #256d85 100%);
+            color: #f8fbfc;
+            font-weight: 800;
+            font-size: 0.82rem;
+            white-space: nowrap;
+        }
+
         .hero-side-copy {
             margin-top: 0.55rem;
             color: var(--muted);
             line-height: 1.45;
+        }
+
+        .kpi-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 0.8rem;
+            margin-bottom: 1.1rem;
+        }
+
+        .kpi-tile {
+            background: rgba(255, 255, 255, 0.92);
+            border-radius: 18px;
+            border: 1px solid rgba(15, 31, 44, 0.08);
+            padding: 0.75rem 0.9rem;
+            box-shadow: 0 10px 26px rgba(15, 31, 44, 0.05);
+        }
+
+        .kpi-tile-label {
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.68rem;
+            font-weight: 700;
+            color: var(--muted);
+        }
+
+        .kpi-tile-value {
+            font-size: 1.45rem;
+            font-weight: 800;
+            margin: 0.3rem 0 0.2rem 0;
+            color: var(--brand);
+        }
+
+        .kpi-tile-copy {
+            font-size: 0.78rem;
+            color: var(--muted);
+        }
+
+        .intel-band {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.25rem;
+        }
+
+        .intel-card {
+            background: rgba(255, 255, 255, 0.94);
+            border-radius: 20px;
+            border: 1px solid rgba(20, 54, 66, 0.12);
+            padding: 1rem 1.05rem;
+            box-shadow: 0 12px 30px rgba(15, 31, 44, 0.06);
+        }
+
+        .intel-title {
+            font-weight: 800;
+            color: var(--ink);
+            margin-bottom: 0.35rem;
+        }
+
+        .intel-copy {
+            font-size: 0.9rem;
+            color: var(--muted);
+            line-height: 1.45;
+        }
+
+        .timeline {
+            background: rgba(255, 255, 255, 0.94);
+            border-radius: 22px;
+            border: 1px solid rgba(15, 31, 44, 0.08);
+            padding: 1rem 1.1rem;
+            margin-bottom: 1.4rem;
+            box-shadow: 0 12px 30px rgba(15, 31, 44, 0.05);
+        }
+
+        .timeline-title {
+            font-weight: 800;
+            color: var(--ink);
+            margin-bottom: 0.6rem;
+        }
+
+        .timeline-track {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0.6rem;
+        }
+
+        .timeline-step {
+            background: rgba(20, 54, 66, 0.08);
+            border-radius: 14px;
+            padding: 0.6rem;
+            text-align: center;
+            font-size: 0.78rem;
+            color: var(--muted);
+        }
+
+        .timeline-step.active {
+            background: rgba(20, 54, 66, 0.15);
+            color: var(--brand);
+            font-weight: 800;
+        }
+
+        .opportunity-card {
+            background: rgba(20, 54, 66, 0.08);
+            border: 1px solid rgba(20, 54, 66, 0.12);
+            border-radius: 18px;
+            padding: 0.85rem 1rem;
+            margin-top: 1rem;
+            color: var(--ink);
+        }
+
+        .opportunity-title {
+            font-weight: 800;
+            margin-bottom: 0.25rem;
+        }
+
+        .focus-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 0.9rem;
+            margin: 1rem 0 1.3rem 0;
+        }
+
+        .focus-card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            border: 1px solid rgba(20, 54, 66, 0.12);
+            padding: 1rem 1.1rem;
+            box-shadow: 0 12px 28px rgba(15, 31, 44, 0.06);
+        }
+
+        .focus-title {
+            font-weight: 800;
+            color: var(--ink);
+            margin-bottom: 0.5rem;
+        }
+
+        .focus-list {
+            display: grid;
+            gap: 0.45rem;
+            font-size: 0.9rem;
+            color: var(--muted);
+        }
+
+        .focus-item strong {
+            color: var(--ink);
+        }
+
+        .focus-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 999px;
+            border: 1px solid rgba(20, 54, 66, 0.12);
+            background: rgba(20, 54, 66, 0.08);
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: var(--brand);
+            margin-top: 0.4rem;
+        }
+
+        .tracker-table-wrap {
+            max-height: 720px;
+            overflow: auto;
+        }
+
+        .tracker-table thead th {
+            position: sticky;
+            top: 0;
+            background: rgba(248, 251, 252, 0.95);
+            z-index: 2;
+        }
+
+        .tracker-table tbody tr:nth-child(even) {
+            background: rgba(15, 31, 44, 0.03);
         }
 
         .section-label {
@@ -1056,15 +1287,17 @@ def build_dependency_summary_html(dependency_summary):
     blocks = []
     for title, value, copy in cards:
         blocks.append(
-            f"""
-            <div class="tracker-note">
-                <div class="tracker-note-top">
-                    <div class="tracker-note-title">{escape(str(title))}</div>
-                    <span class="tracker-badge active">{value}</span>
+            dedent(
+                f"""
+                <div class="tracker-note">
+                    <div class="tracker-note-top">
+                        <div class="tracker-note-title">{escape(str(title))}</div>
+                        <span class="tracker-badge active">{value}</span>
+                    </div>
+                    <div class="tracker-note-copy">{escape(str(copy))}</div>
                 </div>
-                <div class="tracker-note-copy">{escape(str(copy))}</div>
-            </div>
-            """
+                """
+            ).strip()
         )
 
     return f"<div class='tracker-notes'>{''.join(blocks)}</div>"
@@ -1122,6 +1355,180 @@ def render_metric_card(title, value, subtitle, tone="medium"):
             <div class="metric-label">{title}</div>
             <div class="metric-value">{value}</div>
             <div class="metric-subtitle">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_kpi_strip(summary):
+    pending_actions = summary["not_started_tasks"] + summary["blocked_tasks"]
+    high_risk_items = summary["accrual_risks"] + summary["ap_3way_exceptions"]
+    match_rate = summary["bank_match_rate"]
+    bank_matched = summary["bank_matched"]
+    bank_total = summary["bank_total"]
+    ai_candidates = summary["checklist_automation_candidates"]
+
+    st.markdown(
+        f"""
+        <div class="kpi-strip">
+            <div class="kpi-tile">
+                <div class="kpi-tile-label">Close Day Target</div>
+                <div class="kpi-tile-value">4</div>
+                <div class="kpi-tile-copy">From 7 business days</div>
+            </div>
+            <div class="kpi-tile">
+                <div class="kpi-tile-label">Pending Actions</div>
+                <div class="kpi-tile-value">{pending_actions}</div>
+                <div class="kpi-tile-copy">{summary['not_started_tasks']} not started · {summary['blocked_tasks']} blocked</div>
+            </div>
+            <div class="kpi-tile">
+                <div class="kpi-tile-label">High Risk Items</div>
+                <div class="kpi-tile-value">{high_risk_items}</div>
+                <div class="kpi-tile-copy">{summary['accrual_risks']} accruals · {summary['ap_3way_exceptions']} AP</div>
+            </div>
+            <div class="kpi-tile">
+                <div class="kpi-tile-label">Auto-Reconciled</div>
+                <div class="kpi-tile-value">{match_rate}%</div>
+                <div class="kpi-tile-copy">{bank_matched} of {bank_total} bank items</div>
+            </div>
+            <div class="kpi-tile">
+                <div class="kpi-tile-label">AI Candidates</div>
+                <div class="kpi-tile-value">{ai_candidates}</div>
+                <div class="kpi-tile-copy">{summary['bank_journal_candidates']} bank drafts · {summary['journal_agent_ready_drafts']} journals</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_close_intelligence(summary, kpis):
+    variance_rows = kpis["details"]["tb_variances"].head(2)
+    variance_text = ", ".join(
+        f"{row['Account Name']} ({row['Variance %']})" for _, row in variance_rows.iterrows()
+    )
+    variance_text = variance_text or "No major variances flagged"
+
+    st.markdown(
+        f"""
+        <div class="intel-band">
+            <div class="intel-card">
+                <div class="intel-title">GL Approval Bottleneck</div>
+                <div class="intel-copy">
+                    <strong>{summary['pending_gl']}</strong> entries pending review or approval and
+                    <strong> {summary['manual_jes']} </strong> manual journals flagged. Straight-through batching can remove most of this drag.
+                </div>
+            </div>
+            <div class="intel-card">
+                <div class="intel-title">Variance Hotspots</div>
+                <div class="intel-copy">
+                    <strong>{summary['large_variances']}</strong> accounts moved &gt;10%. Largest movements: {variance_text}.
+                    AI variance commentary can cut review time.
+                </div>
+            </div>
+            <div class="intel-card">
+                <div class="intel-title">Close Effort at Risk</div>
+                <div class="intel-copy">
+                    <strong>{summary['checklist_recoverable_hours']} hours</strong> are recoverable by clearing critical checklist handoffs.
+                    Bank automation can clear <strong>{summary['bank_auto_clear_candidates']}</strong> timing items.
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_close_timeline(summary):
+    total_tasks = sum(summary["checklist_status_counts"].values())
+    progress_ratio = summary["completed_tasks"] / total_tasks if total_tasks else 0
+    day_marker = max(1, min(4, int(round(progress_ratio * 4 + 0.5))))
+    labels = [
+        "Day 1 · Pre-close",
+        "Day 2 · Recons & accruals",
+        "Day 3 · IC elim & TB review",
+        "Day 4 · Pack & sign-off",
+    ]
+    steps = []
+    for index, label in enumerate(labels, start=1):
+        active = " active" if index == day_marker else ""
+        steps.append(f"<div class='timeline-step{active}'>{label}</div>")
+
+    st.markdown(
+        f"""
+        <div class="timeline">
+            <div class="timeline-title">Close Day Timeline — Target: 4 Days · Day {day_marker} of 4</div>
+            <div class="timeline-track">{''.join(steps)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_ai_opportunity(title, copy):
+    st.markdown(
+        f"""
+        <div class="opportunity-card">
+            <div class="opportunity-title">{title}</div>
+            <div class="intel-copy">{copy}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_focus_board(kpis, score, priorities):
+    summary = kpis["summary"]
+    posting = kpis["agents"]["erp_posting"]["summary"]
+    checklist_agent = kpis["agents"]["checklist"]
+    top_priorities = priorities[:3]
+    recs = build_below_four_recommendations(kpis)
+
+    if recs.empty:
+        bundle_text = "No tested bundle gets below 4.0 days yet."
+        bundle_chip = f"{score['continuous_close_days']} day forecast"
+    else:
+        top = recs.iloc[0]
+        bundle_text = f"{top['Bundle']} → {top['Continuous Forecast']} day forecast"
+        bundle_chip = f"{top['Hours Saved']} hrs recovered"
+
+    checklist_focus = checklist_agent["handoff_queue"].head(2)
+    if checklist_focus.empty:
+        checklist_text = "No critical checklist handoffs are currently waiting."
+    else:
+        checklist_text = " · ".join(
+            f"{row['Owner']} owns {row['Task']}" for _, row in checklist_focus.iterrows()
+        )
+
+    priority_lines = "".join(
+        f"<div class='focus-item'><strong>{escape(item['priority_item'])}</strong> — {escape(item['downstream_unlock'])}</div>"
+        for item in top_priorities
+    )
+
+    st.markdown(
+        f"""
+        <div class="focus-grid">
+            <div class="focus-card">
+                <div class="focus-title">What to do next</div>
+                <div class="focus-list">{priority_lines}</div>
+                <span class="focus-chip">{summary['pending_gl']} GL approvals · {summary['bank_exceptions']} bank exceptions</span>
+            </div>
+            <div class="focus-card">
+                <div class="focus-title">Fastest path below 4 days</div>
+                <div class="focus-list">
+                    <div class="focus-item">{escape(bundle_text)}</div>
+                </div>
+                <span class="focus-chip">{escape(str(bundle_chip))}</span>
+            </div>
+            <div class="focus-card">
+                <div class="focus-title">Posting & handoffs</div>
+                <div class="focus-list">
+                    <div class="focus-item"><strong>{posting['auto_post']}</strong> auto-post · <strong>{posting['ready_to_post']}</strong> ready · <strong>{posting['manual_hold']}</strong> hold</div>
+                    <div class="focus-item">{escape(checklist_text)}</div>
+                </div>
+                <span class="focus-chip">{summary['checklist_recoverable_hours']} hrs recoverable</span>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1284,6 +1691,64 @@ def build_checklist_chart(summary):
         return figure
 
     return chart_data.set_index("Status")
+
+
+def build_gl_lane_chart(gl_agent):
+    chart_data = gl_agent["lane_breakdown"].copy()
+    if HAS_PLOTLY:
+        figure = px.bar(
+            chart_data,
+            x="Approval Lane",
+            y="Count",
+            text="Count",
+            color="Approval Lane",
+            color_discrete_map={
+                "Straight-through": "#2a9d8f",
+                "Manager queue": "#256d85",
+                "Controller queue": "#d77a2d",
+                "CFO queue": "#c75c5c",
+            },
+        )
+        figure.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_title="",
+            yaxis_title="",
+            showlegend=False,
+        )
+        figure.update_traces(marker_line_width=0, textposition="outside")
+        return figure
+
+    return chart_data.set_index("Approval Lane")
+
+
+def build_gl_entity_chart(gl_agent):
+    chart_data = gl_agent["entity_breakdown"].copy().sort_values("Pending Items")
+    if HAS_PLOTLY:
+        figure = px.bar(
+            chart_data,
+            x="Pending Items",
+            y="Entity",
+            orientation="h",
+            text="Pending Items",
+            color="Pending Items",
+            color_continuous_scale=["#9fc5d1", "#d77a2d", "#c75c5c"],
+        )
+        figure.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            coloraxis_showscale=False,
+            xaxis_title="",
+            yaxis_title="",
+        )
+        figure.update_traces(marker_line_width=0, textposition="outside")
+        return figure
+
+    return chart_data.set_index("Entity")
 
 
 def build_bank_status_chart(bank_agent):
@@ -1505,6 +1970,68 @@ def build_audit_source_chart(audit_agent):
     return chart_data.set_index("Source Agent")
 
 
+def build_posting_status_chart(posting_simulator):
+    chart_data = posting_simulator["status_breakdown"].copy()
+    if HAS_PLOTLY:
+        figure = px.bar(
+            chart_data,
+            x="Posting Outcome",
+            y="Count",
+            text="Count",
+            color="Posting Outcome",
+            color_discrete_map={
+                "Auto-Post": "#2a9d8f",
+                "Ready to Post": "#256d85",
+                "Manual Hold": "#c75c5c",
+            },
+        )
+        figure.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_title="",
+            yaxis_title="",
+            showlegend=False,
+        )
+        figure.update_traces(marker_line_width=0, textposition="outside")
+        return figure
+
+    return chart_data.set_index("Posting Outcome")
+
+
+def build_posting_source_chart(posting_simulator):
+    chart_data = posting_simulator["source_breakdown"].copy()
+    if HAS_PLOTLY:
+        figure = px.bar(
+            chart_data,
+            x="Count",
+            y="Source Agent",
+            color="Posting Outcome",
+            orientation="h",
+            text="Count",
+            color_discrete_map={
+                "Auto-Post": "#2a9d8f",
+                "Ready to Post": "#256d85",
+                "Manual Hold": "#c75c5c",
+            },
+            hover_data={"Amount (EUR)": True},
+        )
+        figure.update_layout(
+            barmode="stack",
+            height=320,
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_title="",
+            yaxis_title="",
+        )
+        figure.update_traces(marker_line_width=0, textposition="outside")
+        return figure
+
+    return chart_data.set_index(["Source Agent", "Posting Outcome"])[["Count", "Amount (EUR)"]]
+
+
 def build_checklist_action_chart(checklist_agent):
     chart_data = checklist_agent["action_breakdown"].copy()
     if HAS_PLOTLY:
@@ -1614,6 +2141,43 @@ def build_priority_chart(priorities):
     return chart_data.set_index("priority_item")[["priority_score", "hours_saved_est"]]
 
 
+def build_below_four_recommendations(kpis):
+    actions = build_scenario_actions(kpis)
+    label_map = {
+        "gl_straight_through": "GL auto-approve",
+        "gl_fast_track_controller": "GL fast-track",
+        "bank_auto_clear": "Bank clear/post",
+        "ic_post_drafts": "IC elimination",
+        "journal_post_ready": "Journal auto-post",
+        "checklist_unblock": "Checklist unblock",
+        "ap_exception_sweep": "AP sweep",
+    }
+    recommendations = []
+
+    for size in (2, 3, 4):
+        for combo in combinations(actions, size):
+            scenario = simulate_close_scenario(kpis, [item["id"] for item in combo])
+            if scenario["gets_below_four"]:
+                recommendations.append(
+                    {
+                        "Bundle": " + ".join(label_map[item["id"]] for item in combo),
+                        "Actions": ", ".join(item["title"] for item in combo),
+                        "Continuous Forecast": scenario["score"]["continuous_close_days"],
+                        "Readiness Score": scenario["score"]["readiness_score"],
+                        "Hours Saved": scenario["total_hours_saved"],
+                    }
+                )
+
+    if not recommendations:
+        return pd.DataFrame(columns=["Bundle", "Actions", "Continuous Forecast", "Readiness Score", "Hours Saved"])
+
+    frame = pd.DataFrame(recommendations).drop_duplicates(subset=["Bundle"])
+    return frame.sort_values(
+        ["Continuous Forecast", "Readiness Score", "Hours Saved"],
+        ascending=[True, False, False],
+    ).head(6)
+
+
 def dataset_key_for(source):
     if isinstance(source, str):
         return source
@@ -1666,7 +2230,7 @@ def render_chat(kpis, score, priorities):
     for index, prompt in enumerate(QUICK_PROMPTS):
         if quick_cols[index % 2].button(prompt, key=f"quick_prompt_{index}", use_container_width=True):
             submit_prompt(prompt, kpis, score, priorities)
-            st.rerun()
+            safe_rerun()
 
     for message in st.session_state["copilot_messages"]:
         with st.chat_message(message["role"]):
@@ -1681,12 +2245,15 @@ def render_chat(kpis, score, priorities):
     prompt = st.chat_input("Ask NovaClose Copilot about blockers, entities, or variances.")
     if prompt:
         submit_prompt(prompt, kpis, score, priorities)
-        st.rerun()
+        safe_rerun()
 
 
 def render_command_center(kpis, score, priorities, commentary):
     summary = kpis["summary"]
     riskiest_entity = kpis["entities"][0]
+
+    render_kpi_strip(summary)
+    render_focus_board(kpis, score, priorities)
 
     st.markdown(
         f"""
@@ -1694,7 +2261,7 @@ def render_command_center(kpis, score, priorities, commentary):
             <div class="hero-eyebrow">Predictive Close Intelligence</div>
             <div class="hero-grid">
                 <div>
-                    <div class="hero-title">NovaClose AI Command Center</div>
+                    <div class="hero-title">NovaClose Command Centre</div>
                     <p class="hero-copy">
                         NovaTech is not missing its target because finance cannot process transactions.
                         It is missing because exceptions, approvals, and dependencies are surfacing too late in the close.
@@ -1714,6 +2281,9 @@ def render_command_center(kpis, score, priorities, commentary):
         """,
         unsafe_allow_html=True,
     )
+
+    render_close_intelligence(summary, kpis)
+    render_close_timeline(summary)
 
     card_cols = st.columns(4)
     with card_cols[0]:
@@ -1760,23 +2330,34 @@ def render_command_center(kpis, score, priorities, commentary):
             st.info("Install `plotly` to unlock the full readiness gauge.")
             st.progress(score["readiness_score"] / 100)
 
-        st.markdown("<div class='section-label'>Risk By Area</div>", unsafe_allow_html=True)
-        area_chart = build_area_chart(kpis)
-        if HAS_PLOTLY:
-            st.plotly_chart(
-                area_chart,
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key="command_center_area_chart",
-            )
-        else:
-            st.bar_chart(area_chart)
-
         st.markdown("<div class='section-label'>Executive Narrative</div>", unsafe_allow_html=True)
         st.info(commentary)
 
+        with st.expander("Risk by area", expanded=False):
+            area_chart = build_area_chart(kpis)
+            if HAS_PLOTLY:
+                st.plotly_chart(
+                    area_chart,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key="command_center_area_chart",
+                )
+            else:
+                st.bar_chart(area_chart)
+
     with right:
-        render_chat(kpis, score, priorities)
+        st.markdown(
+            """
+            <div class="entity-callout">
+                <div class="section-label">AI Copilot</div>
+                <div class="entity-name">Open the AI Copilot tab for live Q&A</div>
+                <div class="entity-copy">
+                    The full copilot experience is now centralized to reduce clutter across tabs.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     footer_cols = st.columns([0.92, 1.08], gap="large")
     with footer_cols[0]:
@@ -1820,6 +2401,95 @@ def render_risk_atlas(kpis):
     detail_key = DETAIL_MAP[selected_key]
     detail_frame = format_display_frame(kpis["details"][detail_key])
     st.dataframe(detail_frame, use_container_width=True, hide_index=True)
+
+
+def render_gl_agent(kpis):
+    gl_agent = kpis["agents"]["gl"]
+    summary = gl_agent["summary"]
+
+    st.markdown(
+        f"""
+        <div class="entity-callout">
+            <div class="section-label">GL Approval Agent</div>
+            <div class="entity-name">{summary['straight_through_candidates']} journals ready for straight-through approval</div>
+            <div class="entity-copy">
+                The GL approval agent triages the pending journal queue into straight-through, manager, controller, and CFO lanes
+                so the team can bulk-approve low-risk items and isolate the real escalation work.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    card_cols = st.columns(6, gap="medium")
+    with card_cols[0]:
+        render_metric_card("Pending GL", str(summary["pending_items"]), "Journals still sitting in review or approval.", "high")
+    with card_cols[1]:
+        render_metric_card("Straight-Through", str(summary["straight_through_candidates"]), "Low-risk journals that can move through an auto-approval batch.", "low")
+    with card_cols[2]:
+        render_metric_card("Manager Queue", str(summary["manager_queue"]), "Low-to-medium risk journals that can be packeted for manager sign-off.", "medium")
+    with card_cols[3]:
+        render_metric_card("Controller Queue", str(summary["controller_queue"]), "Manual, intercompany, revenue, or high-value items requiring controller review.", "high")
+    with card_cols[4]:
+        render_metric_card("CFO Queue", str(summary["cfo_queue"]), "Executive sign-off items based on value or equity impact.", "high")
+    with card_cols[5]:
+        render_metric_card("Hours Recoverable", f"{summary['recoverable_hours']} hrs", "Approval time the agent can recover through batching and straight-through routing.", "low")
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("<div class='section-label'>Approval Lane Mix</div>", unsafe_allow_html=True)
+        lane_chart = build_gl_lane_chart(gl_agent)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                lane_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="gl_agent_lane_chart",
+            )
+        else:
+            st.bar_chart(lane_chart)
+
+    with right:
+        st.markdown("<div class='section-label'>Pending GL by Entity</div>", unsafe_allow_html=True)
+        entity_chart = build_gl_entity_chart(gl_agent)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                entity_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="gl_agent_entity_chart",
+            )
+        else:
+            st.bar_chart(entity_chart)
+
+    upper_left, upper_right = st.columns(2, gap="large")
+    with upper_left:
+        st.markdown("<div class='section-label'>Straight-Through Approval Batch</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(gl_agent["approval_ready"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with upper_right:
+        st.markdown("<div class='section-label'>Approval Packets</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(gl_agent["approval_packets"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Full GL approval worklist", expanded=False):
+        st.dataframe(
+            format_display_frame(gl_agent["worklist"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    render_ai_opportunity(
+        "AI Opportunity",
+        f"Auto-approve {summary['straight_through_candidates']} straight-through journals and batch the manager/controller queue to recover ~{summary['recoverable_hours']} hours of approval chase time.",
+    )
 
 
 def render_bank_agent(kpis):
@@ -1936,6 +2606,11 @@ def render_bank_agent(kpis):
             use_container_width=True,
             hide_index=True,
         )
+
+    render_ai_opportunity(
+        "AI Opportunity",
+        f"Auto-clear {summary['auto_clear_candidates']} timing items and post {summary['journal_candidates']} bank drafts once audit clears them.",
+    )
 
 
 def render_ic_agent(kpis):
@@ -2061,6 +2736,11 @@ def render_ic_agent(kpis):
                 hide_index=True,
             )
 
+    render_ai_opportunity(
+        "AI Opportunity",
+        f"Post {summary['elimination_drafts']} elimination drafts and auto-clear {summary['auto_matched']} matched pairs to remove FX-driven consolidation noise.",
+    )
+
 
 def render_journal_agent(kpis):
     journal_agent = kpis["agents"]["journal"]
@@ -2166,6 +2846,11 @@ def render_journal_agent(kpis):
         format_display_frame(journal_agent["audit_trails"]),
         use_container_width=True,
         hide_index=True,
+    )
+
+    render_ai_opportunity(
+        "AI Opportunity",
+        f"Route {summary['erp_ready_drafts']} ERP-ready drafts into posting after audit, leaving only {summary['review_needed']} items for manual review.",
     )
 
 
@@ -2282,6 +2967,86 @@ def render_audit_agent(kpis):
         hide_index=True,
     )
 
+    render_ai_opportunity(
+        "AI Opportunity",
+        f"Straight-through post {summary['ready_to_post']} drafts once the control score threshold is met and auto-hold the {summary['conditional_approval']} conditional items.",
+    )
+
+
+def render_flux_agent(kpis):
+    flux_agent = kpis["agents"]["flux"]
+    summary = flux_agent["summary"]
+
+    st.markdown(
+        f"""
+        <div class="entity-callout">
+            <div class="section-label">Flux Analysis Agent</div>
+            <div class="entity-name">{summary['mom_anomalies']} MoM anomalies · {summary['yoy_anomalies']} YoY anomalies</div>
+            <div class="entity-copy">
+                This agent computes MoM and YoY movements, scans context cues from GL, accruals, and AP/AR notes, and drafts executive-ready commentary.
+                YoY comparisons are derived from a proxy baseline when prior-year data is not available.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    card_cols = st.columns(4, gap="medium")
+    with card_cols[0]:
+        render_metric_card(
+            "MoM Anomalies",
+            str(summary["mom_anomalies"]),
+            "Accounts moving >10% MoM or flagged for review.",
+            "high",
+        )
+    with card_cols[1]:
+        render_metric_card(
+            "YoY Anomalies",
+            str(summary["yoy_anomalies"]),
+            "Accounts moving >15% vs derived YoY baseline.",
+            "medium",
+        )
+    with card_cols[2]:
+        render_metric_card(
+            "Unreconciled",
+            str(summary["unreconciled"]),
+            "Variance lines still marked unreconciled.",
+            "high",
+        )
+    with card_cols[3]:
+        render_metric_card(
+            "Top Variance",
+            f"EUR {summary['top_variance_amount']:,.2f}",
+            f"Peak variance in {summary['top_variance_account']}.",
+            "medium",
+        )
+
+    st.markdown("<div class='section-label'>Executive Commentary</div>", unsafe_allow_html=True)
+    if flux_agent["commentary"]:
+        for line in flux_agent["commentary"]:
+            st.info(line)
+    else:
+        st.info("No significant anomalies were detected for this period.")
+
+    st.markdown("<div class='section-label'>Anomalies</div>", unsafe_allow_html=True)
+    st.dataframe(
+        format_display_frame(flux_agent["anomalies"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("<div class='section-label'>Flux Worklist</div>", unsafe_allow_html=True)
+    st.dataframe(
+        format_display_frame(flux_agent["worklist"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    render_ai_opportunity(
+        "AI Opportunity",
+        "Auto-generate MoM/YoY variance commentary for all flagged accounts and route the top three anomalies directly into the controller review pack.",
+    )
+
 
 def render_checklist_agent(kpis):
     checklist_agent = kpis["agents"]["checklist"]
@@ -2292,10 +3057,10 @@ def render_checklist_agent(kpis):
     st.markdown(
         f"""
         <div class="entity-callout">
-            <div class="section-label">Checklist Agent</div>
+            <div class="section-label">Close Tracker</div>
             <div class="entity-name">{summary['blocked_tasks']} blocked, {summary['waiting_tasks']} waiting, {summary['critical_open_tasks']} critical still open</div>
             <div class="entity-copy">
-                The checklist agent turns the close checklist into an unblock queue. It traces handoffs across reconciliation,
+                The close tracker turns the checklist into an unblock queue. It traces handoffs across reconciliation,
                 journals, and reporting so the team can remove dependency bottlenecks before they delay consolidation and reporting.
             </div>
         </div>
@@ -2410,6 +3175,181 @@ def render_checklist_agent(kpis):
                 use_container_width=True,
                 hide_index=True,
             )
+
+
+def render_agents_hub(kpis):
+    agent_options = {
+        "GL Approval Agent": render_gl_agent,
+        "Bank Reconciliation Agent": render_bank_agent,
+        "IC Reconciliation Agent": render_ic_agent,
+        "Journal Agent (JE)": render_journal_agent,
+        "Audit & Compliance Agent": render_audit_agent,
+        "Flux Analysis Agent": render_flux_agent,
+    }
+
+    st.markdown(
+        """
+        <div class="entity-callout">
+            <div class="section-label">Agents</div>
+            <div class="entity-name">Operational agents for approvals, reconciliations, journals, and controls</div>
+            <div class="entity-copy">
+                Use the selector below to move between the specialist agents without leaving the main navigation.
+                This keeps the top bar compact while preserving the full workflow across GL, bank, IC, journals, and audit.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    selected_agent = st.selectbox(
+        "Choose an agent view",
+        list(agent_options.keys()),
+        index=0,
+    )
+    agent_options[selected_agent](kpis)
+
+
+def render_scenario_lab(kpis, score):
+    actions = build_scenario_actions(kpis)
+    recommendations = build_below_four_recommendations(kpis)
+    base_posting = kpis["agents"]["erp_posting"]
+
+    st.markdown(
+        f"""
+        <div class="entity-callout">
+            <div class="section-label">Scenario Lab</div>
+            <div class="entity-name">{score['continuous_close_days']} day continuous forecast vs. {score['predicted_close_days']} day dashboard forecast</div>
+            <div class="entity-copy">
+                This simulator applies the agent actions already identified in the app and recomputes a continuous close-day forecast
+                so the team can see which bundles actually get NovaTech below the 4-day target.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    selector_cols = st.columns(2, gap="medium")
+    selected_ids = []
+    for index, action in enumerate(actions):
+        checked = selector_cols[index % 2].checkbox(
+            f"{action['area']}: {action['title']}",
+            value=False,
+            key=f"scenario_action_{action['id']}",
+            help=action["description"],
+        )
+        if checked:
+            selected_ids.append(action["id"])
+
+    scenario = simulate_close_scenario(kpis, selected_ids)
+    delta_days = round(score["continuous_close_days"] - scenario["score"]["continuous_close_days"], 1)
+    posting = scenario["posting_simulator"] if selected_ids else base_posting
+
+    metric_cols = st.columns(5, gap="medium")
+    with metric_cols[0]:
+        render_metric_card("Base Forecast", f"{score['continuous_close_days']} days", "Continuous current-state close forecast.", "medium")
+    with metric_cols[1]:
+        render_metric_card("Scenario Forecast", f"{scenario['score']['continuous_close_days']} days", "Forecast after selected actions are applied.", "low" if scenario["gets_below_four"] else "medium")
+    with metric_cols[2]:
+        render_metric_card("Delta", f"{delta_days} days", "Reduction from the current continuous close forecast.", "low" if delta_days > 0 else "medium")
+    with metric_cols[3]:
+        render_metric_card("Scenario Score", f"{scenario['score']['readiness_score']}/100", "Readiness score after the selected actions.", "low" if scenario["score"]["readiness_score"] >= 80 else "medium")
+    with metric_cols[4]:
+        render_metric_card("Hours Saved", f"{scenario['total_hours_saved']} hrs", "Recovered effort from the selected automation bundle.", "low")
+
+    if selected_ids:
+        status_text = "Below 4 days" if scenario["gets_below_four"] else "Still above 4 days"
+        status_tone = "low" if scenario["gets_below_four"] else "high"
+        render_metric_card(
+            "Scenario Status",
+            status_text,
+            f"Gap to target: {scenario['score']['continuous_gap_to_target_days']} days",
+            status_tone,
+        )
+
+    posting_cols = st.columns(4, gap="medium")
+    with posting_cols[0]:
+        render_metric_card(
+            "Auto-Post",
+            str(posting["summary"]["auto_post"]),
+            f"EUR {posting['summary']['auto_post_amount']:,.2f} can move straight into ERP.",
+            "low",
+        )
+    with posting_cols[1]:
+        render_metric_card(
+            "Ready to Post",
+            str(posting["summary"]["ready_to_post"]),
+            f"EUR {posting['summary']['ready_amount']:,.2f} is cleared but still awaiting release.",
+            "medium",
+        )
+    with posting_cols[2]:
+        render_metric_card(
+            "Manual Hold",
+            str(posting["summary"]["manual_hold"]),
+            f"EUR {posting['summary']['hold_amount']:,.2f} still needs approval or control work.",
+            "high",
+        )
+    with posting_cols[3]:
+        render_metric_card(
+            "Eligible for Auto-Post",
+            str(posting["summary"]["eligible_for_auto_post"]),
+            "Items that can move to auto-post when the relevant agent action is selected.",
+            "medium",
+        )
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("<div class='section-label'>ERP Posting Outcome Mix</div>", unsafe_allow_html=True)
+        posting_status_chart = build_posting_status_chart(posting)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                posting_status_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="scenario_lab_posting_status_chart",
+            )
+        else:
+            st.bar_chart(posting_status_chart)
+
+    with right:
+        st.markdown("<div class='section-label'>Posting Outcome by Source Agent</div>", unsafe_allow_html=True)
+        posting_source_chart = build_posting_source_chart(posting)
+        if HAS_PLOTLY:
+            st.plotly_chart(
+                posting_source_chart,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="scenario_lab_posting_source_chart",
+            )
+        else:
+            st.bar_chart(posting_source_chart)
+
+    queue_left, queue_right = st.columns(2, gap="large")
+    with queue_left:
+        st.markdown("<div class='section-label'>Auto-Post and Ready Queue</div>", unsafe_allow_html=True)
+        ready_display = pd.concat(
+            [posting["auto_post_queue"], posting["ready_queue"]],
+            ignore_index=True,
+        )
+        st.dataframe(
+            format_display_frame(ready_display),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with queue_right:
+        st.markdown("<div class='section-label'>Manual Hold Queue</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(posting["manual_hold_queue"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("<div class='section-label'>Recommended Bundles Below 4 Days</div>", unsafe_allow_html=True)
+    st.dataframe(
+        format_display_frame(recommendations),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def render_priority_engine(priorities):
@@ -2563,29 +3503,44 @@ def render_entity_view(kpis):
 
 def render_app_header(kpis):
     summary = kpis["summary"]
-    st.markdown(
-        f"""
-        <div class="app-header">
+    st.markdown("<div class='app-header'>", unsafe_allow_html=True)
+    left, right = st.columns([0.62, 0.38], gap="small")
+    with left:
+        st.markdown(
+            """
             <div>
                 <div class="app-header-kicker">Month-End Workspace</div>
-                <div class="app-header-title">NovaClose AI</div>
+                <div class="app-header-title">NovaClose</div>
                 <div class="app-header-copy">
                     Current close dataset loaded and ready for review across risk, agents, and actions.
                 </div>
             </div>
-            <div class="app-header-right">
-                <div class="period-pill">Accounting Period: {summary['accounting_period_label']}</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        status_col, period_col, ask_col = st.columns([0.28, 0.52, 0.2], gap="small")
+        with status_col:
+            st.markdown(
+                "<div class='status-pill'><span class='status-dot'></span>Live</div>",
+                unsafe_allow_html=True,
+            )
+        with period_col:
+            st.markdown(
+                f"<div class='period-pill'>Period: {summary['accounting_period_label']}</div>",
+                unsafe_allow_html=True,
+            )
+        with ask_col:
+            if st.button("Ask AI", key="ask_ai_button", use_container_width=True):
+                st.session_state["nav_radio"] = "AI Copilot"
+                safe_rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 apply_theme()
 
 with st.sidebar:
-    st.title("NovaClose AI")
+    st.title("NovaClose")
     st.caption("Pitch-ready demo for the Month-End Challenge")
     uploaded_file = st.file_uploader("Upload an Excel workbook", type=["xlsx"])
     data_source = uploaded_file if uploaded_file is not None else DEFAULT_DATASET
@@ -2606,52 +3561,53 @@ with st.sidebar:
 
 render_app_header(kpis)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
-    [
-        "Command Center",
-        "Risk Atlas",
-        "Bank Agent",
-        "IC Agent",
-        "Journal Agent",
-        "Audit & Compliance",
-        "Checklist Agent",
-        "Priority Engine",
-        "Automation Plays",
-        "Entity View",
-    ]
-)
+nav_items = [
+    "Command Centre",
+    "Close Tracker",
+    "Agents",
+    "Risks",
+    "Scenarios",
+    "Priorities",
+    "Automation",
+    "AI Copilot",
+]
 
-with tab1:
+tab_order = nav_items.copy()
+if st.session_state.get("nav_target") == "AI Copilot":
+    tab_order = ["AI Copilot"] + [tab for tab in nav_items if tab != "AI Copilot"]
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(tab_order)
+tab_map = dict(zip(tab_order, [tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8]))
+
+with tab_map["Command Centre"]:
     render_command_center(kpis, score, priorities, commentary)
 
-with tab2:
-    render_risk_atlas(kpis)
-
-with tab3:
-    render_bank_agent(kpis)
-
-with tab4:
-    render_ic_agent(kpis)
-
-with tab5:
-    render_journal_agent(kpis)
-
-with tab6:
-    render_audit_agent(kpis)
-
-with tab7:
+with tab_map["Close Tracker"]:
     render_checklist_agent(kpis)
 
-with tab8:
+with tab_map["Agents"]:
+    render_agents_hub(kpis)
+
+with tab_map["Risks"]:
+    render_risk_atlas(kpis)
+    render_entity_view(kpis)
+
+with tab_map["Scenarios"]:
+    render_scenario_lab(kpis, score)
+
+with tab_map["Priorities"]:
     render_priority_engine(priorities)
 
-with tab9:
+with tab_map["Automation"]:
     render_automation_plays()
 
-with tab10:
-    render_entity_view(kpis)
+with tab_map["AI Copilot"]:
+    render_chat(kpis, score, priorities)
+
+if st.session_state.get("nav_target") == "AI Copilot":
+    st.session_state["nav_target"] = None
 
 st.divider()
 st.caption(
-    "NovaClose AI turns NovaTech’s close from reactive exception hunting into predictive close intelligence."
+    "NovaClose turns NovaTech’s close from reactive exception hunting into predictive close intelligence."
 )

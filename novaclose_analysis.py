@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +76,18 @@ def _top_records(df, columns, limit=6, sort_by=None, ascending=False):
 
 def _format_currency(value):
     return f"EUR {value:,.0f}"
+
+
+def _parse_variance_pct(value):
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text.rstrip("%"))
+    except ValueError:
+        return None
 
 
 def _derive_accounting_period(data):
@@ -420,6 +433,203 @@ def _dependency_step(value):
     text = str(value).strip()
     if not text:
         return None
+
+
+def _flux_yoy_factor(account_type):
+    account_type = str(account_type).lower()
+    if "revenue" in account_type:
+        return 1.06
+    if "expense" in account_type:
+        return 1.05
+    if "asset" in account_type:
+        return 1.03
+    if "liability" in account_type:
+        return 1.03
+    if "equity" in account_type:
+        return 1.0
+    return 1.04
+
+
+def _collect_flux_context(account_code, account_name, gl, accruals, apar, reviewer_note):
+    snippets = []
+    if reviewer_note and str(reviewer_note).strip():
+        snippets.append(str(reviewer_note).strip())
+
+    gl_desc = (
+        gl.loc[gl["Account Code"].eq(account_code), "Description"]
+        .dropna()
+        .astype(str)
+        .head(2)
+        .tolist()
+    )
+    snippets.extend([text for text in gl_desc if text and text not in snippets])
+
+    accrual_notes = (
+        accruals.loc[accruals["Account Code"].eq(account_code), "Notes"]
+        .dropna()
+        .astype(str)
+        .head(2)
+        .tolist()
+    )
+    snippets.extend([text for text in accrual_notes if text and text not in snippets])
+
+    accrual_desc = (
+        accruals.loc[accruals["Account Code"].eq(account_code), "Description"]
+        .dropna()
+        .astype(str)
+        .head(1)
+        .tolist()
+    )
+    snippets.extend([text for text in accrual_desc if text and text not in snippets])
+
+    name_lower = str(account_name).lower()
+    if "receivable" in name_lower:
+        notes = (
+            apar.loc[apar["Type"].eq("AR"), "Notes"]
+            .dropna()
+            .astype(str)
+            .head(1)
+            .tolist()
+        )
+        snippets.extend([text for text in notes if text and text not in snippets])
+    if "payable" in name_lower or "accrued" in name_lower:
+        notes = (
+            apar.loc[apar["Type"].eq("AP"), "Notes"]
+            .dropna()
+            .astype(str)
+            .head(1)
+            .tolist()
+        )
+        snippets.extend([text for text in notes if text and text not in snippets])
+
+    return snippets[:3]
+
+
+def _build_flux_agent(tb, gl, accruals, apar):
+    frame = tb.copy()
+    frame["Closing Balance (EUR)"] = pd.to_numeric(frame["Closing Balance (EUR)"], errors="coerce").fillna(0)
+    frame["Prior Month Balance (EUR)"] = pd.to_numeric(frame["Prior Month Balance (EUR)"], errors="coerce").fillna(0)
+    frame["Variance (EUR)"] = pd.to_numeric(frame["Variance (EUR)"], errors="coerce").fillna(
+        frame["Closing Balance (EUR)"] - frame["Prior Month Balance (EUR)"]
+    )
+    frame["MoM %"] = frame["Variance %"].apply(_parse_variance_pct)
+    missing_mom = frame["MoM %"].isna()
+    frame.loc[missing_mom, "MoM %"] = np.where(
+        frame.loc[missing_mom, "Prior Month Balance (EUR)"].abs() > 0,
+        (frame.loc[missing_mom, "Variance (EUR)"] / frame.loc[missing_mom, "Prior Month Balance (EUR)"].abs()) * 100,
+        np.nan,
+    )
+
+    if "Prior Year Balance (EUR)" in frame.columns:
+        frame["Prior Year Balance (EUR)"] = pd.to_numeric(
+            frame["Prior Year Balance (EUR)"], errors="coerce"
+        ).fillna(0)
+        frame["YoY Source"] = "Reported"
+        frame["YoY Variance (EUR)"] = frame["Closing Balance (EUR)"] - frame["Prior Year Balance (EUR)"]
+        frame["YoY %"] = np.where(
+            frame["Prior Year Balance (EUR)"].abs() > 0,
+            (frame["YoY Variance (EUR)"] / frame["Prior Year Balance (EUR)"].abs()) * 100,
+            np.nan,
+        )
+    else:
+        frame["YoY Source"] = "Derived proxy"
+        proxy_base = frame["Prior Month Balance (EUR)"] * frame["Account Type"].apply(_flux_yoy_factor)
+        frame["YoY Variance (EUR)"] = frame["Closing Balance (EUR)"] - proxy_base
+        frame["YoY %"] = np.where(
+            proxy_base.abs() > 0,
+            (frame["YoY Variance (EUR)"] / proxy_base.abs()) * 100,
+            np.nan,
+        )
+
+    frame["MoM Flag"] = frame["MoM %"].abs() >= 10
+    frame["YoY Flag"] = frame["YoY %"].abs() >= 15
+    frame["Value Flag"] = frame["Variance (EUR)"].abs() >= 50000
+    frame["Recon Flag"] = ~frame["Reconciled"].eq("Yes")
+
+    anomalies = frame.loc[
+        frame["MoM Flag"] | frame["YoY Flag"] | frame["Value Flag"] | frame["Recon Flag"]
+    ].copy()
+
+    context_rows = []
+    for _, row in anomalies.iterrows():
+        context = _collect_flux_context(
+            row["Account Code"],
+            row["Account Name"],
+            gl,
+            accruals,
+            apar,
+            row.get("Reviewer Notes"),
+        )
+        context_rows.append("; ".join(context))
+
+    anomalies["Context Cues"] = context_rows
+    anomalies["Anomaly Reason"] = anomalies.apply(
+        lambda row: ", ".join(
+            reason
+            for reason, flag in [
+                ("MoM swing", row["MoM Flag"]),
+                ("YoY swing", row["YoY Flag"]),
+                ("Large value move", row["Value Flag"]),
+                ("Unreconciled", row["Recon Flag"]),
+            ]
+            if flag
+        ),
+        axis=1,
+    )
+
+    anomalies = anomalies.sort_values(
+        by="Variance (EUR)", key=lambda col: col.abs(), ascending=False
+    )
+
+    top_anomalies = anomalies.head(6)
+    commentary_blocks = []
+    for _, row in top_anomalies.head(3).iterrows():
+        context = row["Context Cues"] if row["Context Cues"] else "No supporting notes captured yet."
+        commentary_blocks.append(
+            f"{row['Entity']} {row['Account Name']} moved {row['Variance (EUR)']:.0f} EUR "
+            f"({row['MoM %']:.1f}% MoM, {row['YoY %']:.1f}% YoY). Context: {context}"
+        )
+
+    summary = {
+        "mom_anomalies": int(anomalies["MoM Flag"].sum()),
+        "yoy_anomalies": int(anomalies["YoY Flag"].sum()),
+        "unreconciled": int(anomalies["Recon Flag"].sum()),
+        "top_variance_account": top_anomalies["Account Name"].iloc[0] if not top_anomalies.empty else "None",
+        "top_variance_amount": round(float(top_anomalies["Variance (EUR)"].iloc[0]), 2)
+        if not top_anomalies.empty
+        else 0.0,
+        "yoy_source": frame["YoY Source"].iloc[0] if not frame.empty else "Derived proxy",
+    }
+
+    worklist = anomalies.loc[
+        :,
+        [
+            "Entity",
+            "Account Code",
+            "Account Name",
+            "Account Type",
+            "Closing Balance (EUR)",
+            "Prior Month Balance (EUR)",
+            "Variance (EUR)",
+            "MoM %",
+            "YoY %",
+            "YoY Source",
+            "Reconciled",
+            "Reviewer Notes",
+            "Context Cues",
+            "Anomaly Reason",
+        ],
+    ].copy()
+
+    return {
+        "summary": summary,
+        "worklist": worklist,
+        "commentary": commentary_blocks,
+        "anomalies": top_anomalies.loc[
+            :,
+            ["Entity", "Account Name", "Variance (EUR)", "MoM %", "YoY %", "Anomaly Reason", "Context Cues"],
+        ].copy(),
+    }
     if "Step " in text:
         text = text.split("Step ", 1)[1]
     try:
@@ -547,6 +757,178 @@ def _ic_elimination_draft(row, issue_type, owner, confidence):
         "Approval Status": "Draft - Ready for ERP",
         "Confidence %": confidence,
         "Owner": owner,
+    }
+
+
+def _gl_approval_decision(row):
+    amount = float(pd.to_numeric(row["Entry Amount (EUR)"], errors="coerce") or 0)
+    source = str(row["Source"])
+    account_type = str(row["Account Type"])
+    status = str(row["Status"])
+    is_intercompany = str(row["Intercompany Flag"]) == "Yes"
+
+    if amount >= 200000 or account_type == "Equity":
+        return (
+            "CFO queue",
+            "CFO",
+            "Executive approval required",
+            "High-value or equity-impact journal requires CFO sign-off before posting.",
+            64,
+        )
+
+    if source == "Manual Entry" or is_intercompany or account_type == "Revenue" or amount >= 125000:
+        return (
+            "Controller queue",
+            "Controller",
+            "Controller review",
+            "Manual, intercompany, revenue, or high-value content makes this a controller approval item.",
+            72,
+        )
+
+    if (
+        source in {"ERP Auto", "Recurring", "Payroll System", "Fixed Assets"}
+        and not is_intercompany
+        and account_type not in {"Revenue", "Equity"}
+        and amount < 100000
+    ):
+        return (
+            "Straight-through",
+            "Auto-approval batch",
+            "Ready for auto-approval",
+            "System-generated recurring journal falls inside the straight-through tolerance band.",
+            91 if status == "Pending Approval" else 87,
+        )
+
+    return (
+        "Manager queue",
+        "Accounting Manager",
+        "Manager review",
+        "Low-to-medium risk journal can be cleared through the manager approval lane.",
+        80 if status == "Pending Approval" else 76,
+    )
+
+
+def _build_gl_agent(gl):
+    frame = gl.copy()
+    frame["Entry Amount (EUR)"] = frame[["Debit (EUR)", "Credit (EUR)"]].max(axis=1)
+    pending = frame.loc[frame["Status"].isin(["Pending Review", "Pending Approval"])].copy()
+
+    if pending.empty:
+        return {
+            "summary": {
+                "pending_items": 0,
+                "straight_through_candidates": 0,
+                "manager_queue": 0,
+                "controller_queue": 0,
+                "cfo_queue": 0,
+                "manual_high_risk": 0,
+                "erp_ready_after_approval": 0,
+                "recoverable_hours": 0,
+            },
+            "worklist": pd.DataFrame(),
+            "approval_packets": pd.DataFrame(),
+            "approval_ready": pd.DataFrame(),
+            "lane_breakdown": pd.DataFrame(columns=["Approval Lane", "Count"]),
+            "entity_breakdown": pd.DataFrame(columns=["Entity", "Pending Items"]),
+        }
+
+    records = []
+    for _, row in pending.iterrows():
+        lane, approver, approval_action, rationale, confidence = _gl_approval_decision(row)
+        amount = round(float(row["Entry Amount (EUR)"]), 2)
+        records.append(
+            {
+                "Journal Entry ID": row["Journal Entry ID"],
+                "Entity": row["Entity"],
+                "Account Name": row["Account Name"],
+                "Account Type": row["Account Type"],
+                "Source": row["Source"],
+                "Status": row["Status"],
+                "Entry Amount (EUR)": amount,
+                "Approval Lane": lane,
+                "Required Approver": approver,
+                "Approval Action": approval_action,
+                "Intercompany": row["Intercompany Flag"],
+                "Created By": row["Created By"],
+                "Approved By": row["Approved By"] if pd.notna(row["Approved By"]) else "Unassigned",
+                "Confidence %": confidence,
+                "Rationale": rationale,
+            }
+        )
+
+    worklist = pd.DataFrame(records)
+    lane_rank = {
+        "CFO queue": 3,
+        "Controller queue": 2,
+        "Manager queue": 1,
+        "Straight-through": 0,
+    }
+    worklist["Lane Rank"] = worklist["Approval Lane"].map(lane_rank).fillna(0)
+    worklist = worklist.sort_values(
+        ["Lane Rank", "Entry Amount (EUR)", "Confidence %"],
+        ascending=[False, False, False],
+    ).drop(columns=["Lane Rank"])
+
+    approval_packets = worklist.loc[
+        worklist["Approval Lane"].isin(["Manager queue", "Controller queue", "CFO queue"]),
+        [
+            "Journal Entry ID",
+            "Entity",
+            "Account Name",
+            "Source",
+            "Status",
+            "Entry Amount (EUR)",
+            "Approval Lane",
+            "Required Approver",
+            "Rationale",
+        ],
+    ].copy()
+
+    approval_ready = worklist.loc[
+        worklist["Approval Lane"].eq("Straight-through"),
+        [
+            "Journal Entry ID",
+            "Entity",
+            "Account Name",
+            "Source",
+            "Status",
+            "Entry Amount (EUR)",
+            "Approval Action",
+            "Confidence %",
+        ],
+    ].copy()
+
+    lane_breakdown = (
+        worklist["Approval Lane"].value_counts()
+        .rename_axis("Approval Lane")
+        .reindex(["Straight-through", "Manager queue", "Controller queue", "CFO queue"], fill_value=0)
+        .reset_index(name="Count")
+    )
+    entity_breakdown = (
+        worklist["Entity"].value_counts().rename_axis("Entity").reset_index(name="Pending Items")
+    )
+
+    summary = {
+        "pending_items": int(worklist.shape[0]),
+        "straight_through_candidates": int(worklist["Approval Lane"].eq("Straight-through").sum()),
+        "manager_queue": int(worklist["Approval Lane"].eq("Manager queue").sum()),
+        "controller_queue": int(worklist["Approval Lane"].eq("Controller queue").sum()),
+        "cfo_queue": int(worklist["Approval Lane"].eq("CFO queue").sum()),
+        "manual_high_risk": int(
+            worklist["Source"].eq("Manual Entry").sum()
+            + worklist["Intercompany"].eq("Yes").sum()
+        ),
+        "erp_ready_after_approval": int(approval_ready.shape[0]),
+        "recoverable_hours": int(min(12, round(approval_ready.shape[0] * 0.3 + 3))),
+    }
+
+    return {
+        "summary": summary,
+        "worklist": worklist,
+        "approval_packets": approval_packets,
+        "approval_ready": approval_ready,
+        "lane_breakdown": lane_breakdown,
+        "entity_breakdown": entity_breakdown,
     }
 
 
@@ -1613,12 +1995,14 @@ def calculate_kpis(data):
     pending_gl = int(pending_mask.sum())
     manual_jes = int(gl["Source"].eq("Manual Entry").sum())
     posted_jes = int(gl["Status"].eq("Posted").sum())
+    gl_agent = _build_gl_agent(gl)
 
     bank_exception_mask = ~bank["Match Status"].eq("Matched")
     bank_exceptions = int(bank_exception_mask.sum())
     bank_matched = int(bank["Match Status"].eq("Matched").sum())
+    bank_total = int(bank.shape[0])
     bank_stale = int(bank["Days Outstanding"].fillna(0).gt(30).sum())
-    bank_match_rate = float(safe_pct(bank_matched, len(bank)))
+    bank_match_rate = float(safe_pct(bank_matched, bank_total))
     bank_exception_breakdown = (
         bank.loc[bank_exception_mask, "Match Status"].value_counts().sort_values(ascending=False).to_dict()
     )
@@ -1627,6 +2011,7 @@ def calculate_kpis(data):
     journal_agent = _build_journal_agent(accruals)
     audit_agent = _build_audit_agent(bank_agent, ic_agent, journal_agent)
     checklist_agent = _build_checklist_agent(checklist)
+    flux_agent = _build_flux_agent(tb, gl, accruals, apar)
 
     ic_exception_mask = ~ic["Elimination Status"].eq("Eliminated")
     ic_exceptions = int(ic_exception_mask.sum())
@@ -1895,7 +2280,14 @@ def calculate_kpis(data):
         "pending_gl": pending_gl,
         "manual_jes": manual_jes,
         "posted_jes": posted_jes,
+        "gl_straight_through_candidates": gl_agent["summary"]["straight_through_candidates"],
+        "gl_manager_queue": gl_agent["summary"]["manager_queue"],
+        "gl_controller_queue": gl_agent["summary"]["controller_queue"],
+        "gl_cfo_queue": gl_agent["summary"]["cfo_queue"],
+        "gl_approval_recoverable_hours": gl_agent["summary"]["recoverable_hours"],
         "bank_exceptions": bank_exceptions,
+        "bank_total": bank_total,
+        "bank_matched": bank_matched,
         "bank_stale": bank_stale,
         "bank_match_rate": bank_match_rate,
         "bank_auto_clear_candidates": bank_agent["summary"]["auto_clear_candidates"],
@@ -1914,6 +2306,10 @@ def calculate_kpis(data):
         "audit_conditional": audit_agent["summary"]["conditional_approval"],
         "audit_blocked": audit_agent["summary"]["blocked_for_review"],
         "audit_avg_control_score": audit_agent["summary"]["average_control_score"],
+        "flux_mom_anomalies": flux_agent["summary"]["mom_anomalies"],
+        "flux_yoy_anomalies": flux_agent["summary"]["yoy_anomalies"],
+        "flux_unreconciled": flux_agent["summary"]["unreconciled"],
+        "flux_top_variance_amount": flux_agent["summary"]["top_variance_amount"],
         "checklist_handoffs_at_risk": checklist_agent["summary"]["handoffs_at_risk"],
         "checklist_recoverable_hours": checklist_agent["summary"]["recoverable_hours"],
         "checklist_automation_candidates": checklist_agent["summary"]["automation_candidates"],
@@ -1945,19 +2341,40 @@ def calculate_kpis(data):
         "riskiest_entity_blocker": riskiest_entity["driver_summary"] if riskiest_entity else None,
     }
 
-    return {
+    kpis = {
         "summary": summary,
         "areas": areas,
         "entities": entities,
         "details": details,
         "agents": {
+            "gl": gl_agent,
             "bank": bank_agent,
             "ic": ic_agent,
             "journal": journal_agent,
             "audit": audit_agent,
             "checklist": checklist_agent,
+            "flux": flux_agent,
         },
     }
+
+    erp_posting = build_erp_posting_simulator(kpis)
+    kpis["agents"]["erp_posting"] = erp_posting
+    kpis["summary"].update(
+        {
+            "erp_auto_post": erp_posting["summary"]["auto_post"],
+            "erp_ready_to_post": erp_posting["summary"]["ready_to_post"],
+            "erp_manual_hold": erp_posting["summary"]["manual_hold"],
+            "erp_auto_post_eligible": erp_posting["summary"]["eligible_for_auto_post"],
+        }
+    )
+
+    return kpis
+
+
+def _continuous_close_days_from_penalties(penalties):
+    penalty_points = sum(item["points"] for item in penalties)
+    days = 3.2 + (penalty_points / 60.0)
+    return round(max(3.2, min(5.9, days)), 1)
 
 
 def calculate_readiness_score(kpis):
@@ -2018,6 +2435,7 @@ def calculate_readiness_score(kpis):
 
     score = max(0, min(100, score))
     score = int(round(55 + (score * 0.45)))
+    continuous_close_days = _continuous_close_days_from_penalties(penalties)
 
     if score >= 80:
         risk_level = "Low"
@@ -2030,13 +2448,218 @@ def calculate_readiness_score(kpis):
         predicted_days = 5.6
 
     gap_to_target_days = round(max(0, predicted_days - 4.0), 1)
+    continuous_gap_to_target_days = round(max(0, continuous_close_days - 4.0), 1)
 
     return {
         "readiness_score": score,
         "risk_level": risk_level,
         "predicted_close_days": predicted_days,
+        "continuous_close_days": continuous_close_days,
         "gap_to_target_days": gap_to_target_days,
+        "continuous_gap_to_target_days": continuous_gap_to_target_days,
         "penalties": penalties,
+    }
+
+
+def _source_action_for_posting(source_agent):
+    return {
+        "Bank Agent": "bank_auto_clear",
+        "IC Agent": "ic_post_drafts",
+        "Journal Agent": "journal_post_ready",
+    }.get(source_agent)
+
+
+def _source_action_label(action_id):
+    return {
+        "gl_straight_through": "GL straight-through approval",
+        "gl_fast_track_controller": "GL batched approvals",
+        "bank_auto_clear": "Bank clear/post action",
+        "ic_post_drafts": "IC elimination posting",
+        "journal_post_ready": "Journal auto-post",
+    }.get(action_id, "Manual release")
+
+
+def build_erp_posting_simulator(kpis, selected_action_ids=None):
+    selected_ids = set(selected_action_ids or [])
+    gl_agent = kpis["agents"]["gl"]
+    audit_agent = kpis["agents"]["audit"]
+    rows = []
+
+    gl_worklist = gl_agent["worklist"].copy()
+    controller_slots = 20 if "gl_fast_track_controller" in selected_ids else 0
+
+    if not gl_worklist.empty:
+        for _, row in gl_worklist.iterrows():
+            lane = row["Approval Lane"]
+            outcome = "Manual Hold"
+            eligible = "No"
+            trigger_action = ""
+            hold_reason = ""
+            next_step = ""
+
+            if lane == "Straight-through":
+                eligible = "Yes"
+                trigger_action = _source_action_label("gl_straight_through")
+                if "gl_straight_through" in selected_ids:
+                    outcome = "Auto-Post"
+                    next_step = "Release the straight-through approval batch and post directly to ERP."
+                else:
+                    outcome = "Ready to Post"
+                    next_step = "Approve the straight-through batch to release ERP posting."
+            elif lane == "Manager queue":
+                trigger_action = _source_action_label("gl_fast_track_controller")
+                if "gl_fast_track_controller" in selected_ids:
+                    outcome = "Ready to Post"
+                    next_step = "Manager packet is batched and can be released to ERP after sign-off."
+                else:
+                    hold_reason = "Pending manager approval packet"
+                    next_step = "Route into the manager approval packet."
+            elif lane == "Controller queue":
+                trigger_action = _source_action_label("gl_fast_track_controller")
+                if controller_slots > 0:
+                    outcome = "Ready to Post"
+                    controller_slots -= 1
+                    next_step = "Controller packet is fast-tracked and can be released after approval."
+                elif "gl_fast_track_controller" in selected_ids:
+                    hold_reason = "Controller queue remains above the fast-track batch limit"
+                    next_step = "Keep in the next controller approval packet."
+                else:
+                    hold_reason = "Pending controller approval"
+                    next_step = "Escalate through the controller approval queue."
+            else:
+                hold_reason = "Executive approval still required"
+                next_step = "Hold for CFO sign-off before ERP posting."
+
+            rows.append(
+                {
+                    "Posting Item ID": row["Journal Entry ID"],
+                    "Source Agent": "GL Approval Agent",
+                    "Entity": row["Entity"],
+                    "Item Type": "GL Journal",
+                    "Amount (EUR)": float(pd.to_numeric(row["Entry Amount (EUR)"], errors="coerce") or 0),
+                    "Current Gate": lane,
+                    "Posting Outcome": outcome,
+                    "Auto-Post Eligible": eligible,
+                    "Trigger Action": trigger_action or "Manual release",
+                    "Required Approver": row["Required Approver"],
+                    "Manual Hold Reason": hold_reason or "None",
+                    "Next ERP Step": next_step,
+                }
+            )
+
+    audit_pack = audit_agent["review_pack"].copy()
+    if not audit_pack.empty:
+        for _, row in audit_pack.iterrows():
+            source_agent = row["Source Agent"]
+            source_action = _source_action_for_posting(source_agent)
+            recommendation = row["Posting Recommendation"]
+            outcome = "Manual Hold"
+            eligible = "No"
+            hold_reason = ""
+            next_step = ""
+
+            if recommendation == "Ready to Post":
+                eligible = "Yes"
+                if source_action in selected_ids:
+                    outcome = "Auto-Post"
+                    next_step = "Control-cleared draft is released directly into ERP posting."
+                else:
+                    outcome = "Ready to Post"
+                    next_step = "Draft is control-cleared and waiting for posting release."
+            elif recommendation == "Conditional Approval":
+                hold_reason = row["Primary Control Gap"]
+                next_step = f"Obtain {row['Required Approver']} approval and clear the control gap."
+            else:
+                hold_reason = row["Primary Control Gap"]
+                next_step = "Resolve blocking control issues before any ERP posting attempt."
+
+            rows.append(
+                {
+                    "Posting Item ID": row["Journal ID"],
+                    "Source Agent": source_agent,
+                    "Entity": row["Entity"],
+                    "Item Type": row["JE Type"],
+                    "Amount (EUR)": float(pd.to_numeric(row["Amount (EUR)"], errors="coerce") or 0),
+                    "Current Gate": recommendation,
+                    "Posting Outcome": outcome,
+                    "Auto-Post Eligible": eligible,
+                    "Trigger Action": _source_action_label(source_action) if source_action else "Manual release",
+                    "Required Approver": row["Required Approver"],
+                    "Manual Hold Reason": hold_reason or "None",
+                    "Next ERP Step": next_step,
+                }
+            )
+
+    worklist = pd.DataFrame(rows)
+    if worklist.empty:
+        empty_status = pd.DataFrame(columns=["Posting Outcome", "Count"])
+        empty_sources = pd.DataFrame(columns=["Source Agent", "Posting Outcome", "Count", "Amount (EUR)"])
+        return {
+            "summary": {
+                "total_items": 0,
+                "auto_post": 0,
+                "ready_to_post": 0,
+                "manual_hold": 0,
+                "eligible_for_auto_post": 0,
+                "auto_post_amount": 0.0,
+                "ready_amount": 0.0,
+                "hold_amount": 0.0,
+            },
+            "worklist": worklist,
+            "auto_post_queue": worklist,
+            "ready_queue": worklist,
+            "manual_hold_queue": worklist,
+            "status_breakdown": empty_status,
+            "source_breakdown": empty_sources,
+        }
+
+    outcome_rank = {"Auto-Post": 0, "Ready to Post": 1, "Manual Hold": 2}
+    worklist["Outcome Rank"] = worklist["Posting Outcome"].map(outcome_rank).fillna(9)
+    worklist = worklist.sort_values(
+        ["Outcome Rank", "Amount (EUR)"],
+        ascending=[True, False],
+    ).drop(columns=["Outcome Rank"])
+
+    auto_post_queue = worklist.loc[worklist["Posting Outcome"].eq("Auto-Post")].copy()
+    ready_queue = worklist.loc[worklist["Posting Outcome"].eq("Ready to Post")].copy()
+    manual_hold_queue = worklist.loc[worklist["Posting Outcome"].eq("Manual Hold")].copy()
+
+    status_breakdown = (
+        worklist["Posting Outcome"]
+        .value_counts()
+        .reindex(["Auto-Post", "Ready to Post", "Manual Hold"], fill_value=0)
+        .rename_axis("Posting Outcome")
+        .reset_index(name="Count")
+    )
+    source_breakdown = (
+        worklist.groupby(["Source Agent", "Posting Outcome"])
+        .agg(
+            Count=("Posting Item ID", "count"),
+            **{"Amount (EUR)": ("Amount (EUR)", "sum")},
+        )
+        .reset_index()
+    )
+    source_breakdown["Amount (EUR)"] = source_breakdown["Amount (EUR)"].round(2)
+
+    summary = {
+        "total_items": int(worklist.shape[0]),
+        "auto_post": int(auto_post_queue.shape[0]),
+        "ready_to_post": int(ready_queue.shape[0]),
+        "manual_hold": int(manual_hold_queue.shape[0]),
+        "eligible_for_auto_post": int(worklist["Auto-Post Eligible"].eq("Yes").sum()),
+        "auto_post_amount": round(float(auto_post_queue["Amount (EUR)"].sum()), 2),
+        "ready_amount": round(float(ready_queue["Amount (EUR)"].sum()), 2),
+        "hold_amount": round(float(manual_hold_queue["Amount (EUR)"].sum()), 2),
+    }
+
+    return {
+        "summary": summary,
+        "worklist": worklist,
+        "auto_post_queue": auto_post_queue,
+        "ready_queue": ready_queue,
+        "manual_hold_queue": manual_hold_queue,
+        "status_breakdown": status_breakdown,
+        "source_breakdown": source_breakdown,
     }
 
 
@@ -2152,6 +2775,112 @@ def priority_engine(kpis):
     return priorities
 
 
+def build_scenario_actions(kpis):
+    summary = kpis["summary"]
+    agents = kpis["agents"]
+    return [
+        {
+            "id": "gl_straight_through",
+            "area": "GL Approval Agent",
+            "title": f"Auto-approve {agents['gl']['summary']['straight_through_candidates']} straight-through journals",
+            "description": "System-generated low-risk journals move from pending review into the approval batch automatically.",
+            "hours_saved": agents["gl"]["summary"]["recoverable_hours"],
+        },
+        {
+            "id": "gl_fast_track_controller",
+            "area": "GL Approval Agent",
+            "title": "Fast-track manager and controller approval packets",
+            "description": "Route the non-CFO queue through batched approval packets and remove manual approval chasing.",
+            "hours_saved": 8,
+        },
+        {
+            "id": "bank_auto_clear",
+            "area": "Bank Agent",
+            "title": f"Clear {summary['bank_auto_clear_candidates']} timing items and post {summary['bank_journal_candidates']} bank drafts",
+            "description": "Auto-clear recurring timing items and move bank journal candidates into ERP posting.",
+            "hours_saved": 5,
+        },
+        {
+            "id": "ic_post_drafts",
+            "area": "IC Agent",
+            "title": f"Post {summary['ic_elimination_drafts']} IC elimination drafts and clear matched pairs",
+            "description": "Use the IC agent to close FX mismatches and remove elimination blockers from consolidation.",
+            "hours_saved": 5,
+        },
+        {
+            "id": "journal_post_ready",
+            "area": "Journal Agent",
+            "title": f"Post {summary['journal_agent_ready_drafts']} ERP-ready journal drafts",
+            "description": "Move audit-cleared accrual and reclassification drafts into ERP posting and leave only review exceptions open.",
+            "hours_saved": 5,
+        },
+        {
+            "id": "checklist_unblock",
+            "area": "Checklist Agent",
+            "title": f"Auto-release blocked checklist handoffs ({summary['checklist_recoverable_hours']} hrs recoverable)",
+            "description": "Auto-escalate blocked tasks, release completed handoffs, and notify owners on the critical path.",
+            "hours_saved": summary["checklist_recoverable_hours"],
+        },
+        {
+            "id": "ap_exception_sweep",
+            "area": "AP Exceptions",
+            "title": "Sweep low-risk AP matching exceptions",
+            "description": "Resolve the easier 3-way exceptions in one batch to reduce subledger noise.",
+            "hours_saved": 3,
+        },
+    ]
+
+
+def simulate_close_scenario(kpis, selected_action_ids):
+    scenario = deepcopy(kpis)
+    summary = scenario["summary"]
+    base_summary = kpis["summary"]
+    selected_ids = set(selected_action_ids)
+
+    if "gl_straight_through" in selected_ids:
+        summary["pending_gl"] = max(0, summary["pending_gl"] - base_summary["gl_straight_through_candidates"])
+
+    if "gl_fast_track_controller" in selected_ids:
+        reduction = base_summary["gl_manager_queue"] + min(base_summary["gl_controller_queue"], 20)
+        summary["pending_gl"] = max(0, summary["pending_gl"] - reduction)
+
+    if "bank_auto_clear" in selected_ids:
+        reduction = base_summary["bank_auto_clear_candidates"] + base_summary["bank_journal_candidates"]
+        summary["bank_exceptions"] = max(0, summary["bank_exceptions"] - reduction)
+        summary["bank_stale"] = max(0, summary["bank_stale"] - 2)
+
+    if "ic_post_drafts" in selected_ids:
+        summary["ic_exceptions"] = max(0, summary["ic_exceptions"] - base_summary["ic_elimination_drafts"])
+        if summary["ic_exceptions"] == 0:
+            summary["ic_total_diff"] = 0.0
+
+    if "journal_post_ready" in selected_ids:
+        remaining_review = max(1, base_summary["journal_agent_review_needed"])
+        summary["accrual_risks"] = min(summary["accrual_risks"], remaining_review)
+        summary["accrual_missing_docs"] = min(summary["accrual_missing_docs"], remaining_review)
+
+    if "checklist_unblock" in selected_ids:
+        summary["blocked_tasks"] = 0
+        summary["waiting_tasks"] = 1
+        summary["critical_open_tasks"] = max(3, summary["critical_open_tasks"] - 4)
+
+    if "ap_exception_sweep" in selected_ids:
+        summary["ap_3way_exceptions"] = max(0, summary["ap_3way_exceptions"] - 4)
+
+    score = calculate_readiness_score(scenario)
+    selected_actions = [action for action in build_scenario_actions(kpis) if action["id"] in selected_ids]
+    total_hours_saved = sum(action["hours_saved"] for action in selected_actions)
+    posting_simulator = build_erp_posting_simulator(kpis, selected_ids)
+
+    return {
+        "selected_actions": selected_actions,
+        "score": score,
+        "total_hours_saved": total_hours_saved,
+        "posting_simulator": posting_simulator,
+        "gets_below_four": score["continuous_close_days"] < 4.0,
+    }
+
+
 def generate_commentary(kpis, score):
     summary = kpis["summary"]
     entity = summary["riskiest_entity"]
@@ -2173,6 +2902,13 @@ def _route_copilot_intent(prompt):
     if not text:
         return "general"
 
+    if any(keyword in text for keyword in ["gl agent", "gl approval", "journal approvals", "approval agent"]):
+        return "gl_agent"
+    if any(
+        keyword in text
+        for keyword in ["erp posting", "auto-post", "ready to post", "manual hold", "posting simulator"]
+    ):
+        return "erp_posting"
     if any(keyword in text for keyword in ["bank agent", "bank reconciliation agent", "bank rec agent", "cash agent"]):
         return "bank_agent"
     if any(
@@ -2219,10 +2955,12 @@ def _route_copilot_intent(prompt):
         return "audit_agent"
     if any(keyword in text for keyword in ["riskiest entity", "which entity", "entity risk", "entity is riskiest"]):
         return "riskiest_entity"
-    if any(keyword in text for keyword in ["variance", "trial balance", "tb"]):
-        return "tb_variances"
+    if any(keyword in text for keyword in ["variance", "trial balance", "tb", "flux", "mom", "yoy"]):
+        return "flux_agent"
     if any(keyword in text for keyword in ["automate", "automation", "auto", "automated"]):
         return "automation_opportunities"
+    if any(keyword in text for keyword in ["below 4", "under 4", "4 days", "scenario", "simulator"]):
+        return "below_four"
     if any(keyword in text for keyword in ["cfo", "executive", "summary", "board"]):
         return "cfo_summary"
     if any(keyword in text for keyword in ["delay", "blocker", "risk", "close"]):
@@ -2234,26 +2972,32 @@ def generate_copilot_response(prompt, kpis, score, priorities):
     summary = kpis["summary"]
     entities = kpis["entities"]
     details = kpis["details"]
+    gl_agent = kpis["agents"]["gl"]
     bank_agent = kpis["agents"]["bank"]
     ic_agent = kpis["agents"]["ic"]
     journal_agent = kpis["agents"]["journal"]
     audit_agent = kpis["agents"]["audit"]
     checklist_agent = kpis["agents"]["checklist"]
+    flux_agent = kpis["agents"]["flux"]
+    erp_posting = kpis["agents"]["erp_posting"]
+    scenario_actions = build_scenario_actions(kpis)
     top_priorities = priorities[:3]
     top_entity = entities[0] if entities else None
-    top_variances = details["tb_variances"].head(3)
     intent = _route_copilot_intent(prompt)
 
     follow_ups = [
         "What issues will delay the close?",
+        "What should the GL approval agent do next?",
+        "What can auto-post to ERP?",
         "What should the bank agent do next?",
         "What should the IC agent do next?",
         "What should the journal agent post?",
+        "What gets us below 4 days?",
         "What checklist tasks need to be unblocked?",
         "What does audit need to review before posting?",
         "What should the controller do today?",
         "Which entity is riskiest?",
-        "Explain the biggest variances.",
+        "Explain MoM / YoY variances.",
     ]
 
     if intent == "close_blockers":
@@ -2321,20 +3065,62 @@ def generate_copilot_response(prompt, kpis, score, priorities):
             f"Risk {top_entity['risk_score']}/100",
             top_entity["driver_summary"],
         ]
-    elif intent == "tb_variances":
-        variance_lines = [
-            f"{row['Entity']}: {row['Account Name']} at {row['Variance %']}"
-            for _, row in top_variances.iterrows()
+    elif intent == "flux_agent":
+        anomaly_rows = flux_agent["anomalies"].head(3)
+        anomaly_lines = [
+            f"{row['Entity']}: {row['Account Name']} at {row['Variance (EUR)']:.0f} EUR ({row['MoM %']:.1f}% MoM, {row['YoY %']:.1f}% YoY)"
+            for _, row in anomaly_rows.iterrows()
         ]
         answer = (
-            f"The trial balance shows {summary['large_variances']} lines moving more than 10% and "
-            f"{summary['unreconciled_tb']} unreconciled accounts. The biggest movements right now are:\n\n"
-            + "\n".join(f"- {line}" for line in variance_lines)
+            f"The flux agent found {flux_agent['summary']['mom_anomalies']} MoM and "
+            f"{flux_agent['summary']['yoy_anomalies']} YoY anomalies. "
+            f"Top movements are:\n\n"
+            + "\n".join(f"- {line}" for line in anomaly_lines)
         )
         source_metrics = [
-            f"{summary['large_variances']} large variances",
-            f"{summary['unreconciled_tb']} unreconciled TB lines",
-            f"Max variance {summary['max_tb_variance_pct']}%",
+            f"{flux_agent['summary']['mom_anomalies']} MoM anomalies",
+            f"{flux_agent['summary']['yoy_anomalies']} YoY anomalies",
+            f"Top variance EUR {flux_agent['summary']['top_variance_amount']:.0f}",
+        ]
+    elif intent == "gl_agent":
+        worklist = gl_agent["worklist"].head(3)
+        action_lines = [
+            f"- {row['Journal Entry ID']}: {row['Approval Lane']} | {row['Required Approver']} | EUR {row['Entry Amount (EUR)']:,.2f}"
+            for _, row in worklist.iterrows()
+        ]
+        answer = (
+            f"The GL approval agent is triaging {gl_agent['summary']['pending_items']} pending journals. "
+            f"It sees {gl_agent['summary']['straight_through_candidates']} straight-through candidates, "
+            f"{gl_agent['summary']['manager_queue']} manager approvals, "
+            f"{gl_agent['summary']['controller_queue']} controller items, and "
+            f"{gl_agent['summary']['cfo_queue']} CFO items. "
+            f"The fastest win is auto-approving the straight-through queue and batching the manager/controller packets.\n\n"
+            + "\n".join(action_lines)
+        )
+        source_metrics = [
+            f"{gl_agent['summary']['straight_through_candidates']} straight-through",
+            f"{gl_agent['summary']['manager_queue']} manager queue",
+            f"{gl_agent['summary']['controller_queue']} controller queue",
+            f"{gl_agent['summary']['cfo_queue']} CFO queue",
+        ]
+    elif intent == "erp_posting":
+        holds = erp_posting["manual_hold_queue"].head(3)
+        hold_lines = [
+            f"- {row['Posting Item ID']}: {row['Source Agent']} | {row['Manual Hold Reason']}"
+            for _, row in holds.iterrows()
+        ]
+        answer = (
+            f"The ERP posting simulator currently sees {erp_posting['summary']['auto_post']} items on auto-post, "
+            f"{erp_posting['summary']['ready_to_post']} ready to post, and "
+            f"{erp_posting['summary']['manual_hold']} still on manual hold. "
+            f"{erp_posting['summary']['eligible_for_auto_post']} items are structurally eligible for auto-post once the right agent actions are switched on.\n\n"
+            + ("\n".join(hold_lines) if hold_lines else "No manual holds remain in the simulated posting queue.")
+        )
+        source_metrics = [
+            f"{erp_posting['summary']['auto_post']} auto-post",
+            f"{erp_posting['summary']['ready_to_post']} ready to post",
+            f"{erp_posting['summary']['manual_hold']} manual hold",
+            f"{erp_posting['summary']['eligible_for_auto_post']} eligible",
         ]
     elif intent == "bank_agent":
         worklist = bank_agent["worklist"].head(3)
@@ -2435,10 +3221,45 @@ def generate_copilot_response(prompt, kpis, score, priorities):
             f"{checklist_agent['summary']['critical_open_tasks']} critical open",
             f"{checklist_agent['summary']['recoverable_hours']} hrs recoverable",
         ]
+    elif intent == "below_four":
+        label_map = {
+            "gl_straight_through": "GL auto-approve",
+            "gl_fast_track_controller": "GL fast-track",
+            "bank_auto_clear": "Bank clear/post",
+            "ic_post_drafts": "IC elimination",
+            "journal_post_ready": "Journal auto-post",
+            "checklist_unblock": "Checklist unblock",
+            "ap_exception_sweep": "AP sweep",
+        }
+        bundles = [
+            ["gl_straight_through", "gl_fast_track_controller", "checklist_unblock"],
+            ["gl_straight_through", "gl_fast_track_controller", "bank_auto_clear"],
+            ["bank_auto_clear", "ic_post_drafts", "checklist_unblock"],
+            ["gl_straight_through", "bank_auto_clear", "ic_post_drafts"],
+        ]
+        bundle_lines = []
+        for bundle in bundles:
+            scenario = simulate_close_scenario(kpis, bundle)
+            if not scenario["gets_below_four"]:
+                continue
+            labels = [label_map[action["id"]] for action in scenario["selected_actions"]]
+            bundle_lines.append(f"- {' + '.join(labels)} -> {scenario['score']['continuous_close_days']} day forecast")
+        answer = (
+            f"The continuous close forecast is currently {score['continuous_close_days']} days. "
+            f"To get below 4.0, NovaClose needs a bundled move rather than a single fix. "
+            f"The best bundles in the simulator right now are:\n\n"
+            + ("\n".join(bundle_lines) if bundle_lines else "No tested bundle currently gets below 4.0 days.")
+        )
+        source_metrics = [
+            f"{score['continuous_close_days']} day base forecast",
+            f"{gl_agent['summary']['straight_through_candidates']} GL auto-approvals",
+            f"{bank_agent['summary']['auto_clear_candidates']} bank auto-clears",
+            f"{checklist_agent['summary']['recoverable_hours']} checklist hrs",
+        ]
     else:
         answer = (
             "NovaClose Copilot is optimized for close blockers, today’s controller actions, automation opportunities, "
-            "bank reconciliation triage, journal drafting, checklist unblocking, audit review, riskiest entity analysis, and trial balance variance summaries. Start with one of those questions and I’ll answer using the dataset already loaded into the app."
+            "GL approval triage, bank reconciliation triage, intercompany matching, journal drafting, checklist unblocking, audit review, riskiest entity analysis, and trial balance variance summaries. Start with one of those questions and I’ll answer using the dataset already loaded into the app."
         )
         source_metrics = [
             f"{summary['pending_gl']} pending GL",

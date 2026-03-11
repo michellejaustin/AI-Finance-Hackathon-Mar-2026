@@ -1,10 +1,10 @@
-# NovaClose AI
+# NovaClose
 
 Pitch-ready month-end close intelligence demo for the NovaTech finance hackathon dataset.
 
 ## What It Does
 
-NovaClose AI turns a slow, exception-heavy close into a ranked action plan.
+NovaClose turns a slow, exception-heavy close into a ranked action plan.
 
 The app scans the NovaTech workbook, detects what is blocking the close, predicts how far the team is from the 4-day CFO target, and lets the user query the results through a copilot-style interface.
 
@@ -164,7 +164,7 @@ http://localhost:8501
 Suggested one-line pitch:
 
 ```text
-NovaClose AI identifies the exceptions that delay month-end close, predicts close risk early, and tells finance exactly what to fix first.
+NovaClose identifies the exceptions that delay month-end close, predicts close risk early, and tells finance exactly what to fix first.
 ```
 
 Suggested before/after framing:
