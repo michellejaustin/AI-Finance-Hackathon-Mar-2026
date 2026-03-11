@@ -2,7 +2,9 @@ from html import escape
 from itertools import combinations
 from pathlib import Path
 from textwrap import dedent
+import re
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -82,6 +84,95 @@ def safe_rerun():
     rerun_fn = getattr(st, "experimental_rerun", None)
     if callable(rerun_fn):
         rerun_fn()
+
+
+def format_number(value, decimals=0):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    formatted = f"{abs(number):,.{decimals}f}"
+    if decimals == 0:
+        formatted = formatted.split(".")[0]
+    return f"({formatted})" if number < 0 else formatted
+
+
+def format_percent(value, decimals=2):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    formatted = f"{abs(number):,.{decimals}f}%"
+    return f"({formatted})" if number < 0 else formatted
+
+
+def format_metric_value(value):
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        decimals = 2 if isinstance(value, (float, np.floating)) and not float(value).is_integer() else 0
+        return format_number(value, decimals)
+
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if not text:
+        return value
+
+    percent_match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if "%" in text and percent_match:
+        number = float(percent_match.group())
+        formatted = format_percent(number, 2).replace("%", "")
+        return re.sub(r"-?\d+(?:\.\d+)?", formatted, text, count=1)
+
+    currency_match = re.match(r"^([A-Za-z]{3})\s+(-?\d+(?:\.\d+)?)(.*)$", text)
+    if currency_match:
+        prefix, number, suffix = currency_match.groups()
+        decimals = 2 if "." in number else 0
+        return f"{prefix} {format_number(float(number), decimals)}{suffix}"
+
+    number_match = re.match(r"^(-?\d+(?:\.\d+)?)(.*)$", text)
+    if number_match:
+        number, suffix = number_match.groups()
+        decimals = 2 if "." in number else 0
+        formatted = format_number(float(number), decimals)
+        suffix = suffix.strip()
+        return f"{formatted} {suffix}".strip()
+
+    return value
+
+
+def run_all_automations(kpis, actions):
+    action_ids = [action["id"] for action in actions]
+    scenario = simulate_close_scenario(kpis, action_ids)
+    posting = scenario["posting_simulator"]["summary"]
+    log_entries = []
+    for action in actions:
+        log_entries.append(
+            {
+                "Timestamp": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                "Action": action["title"],
+                "Area": action["area"],
+                "Hours Saved": action["hours_saved"],
+                "Forecast After": scenario["score"]["continuous_close_days"],
+                "Auto-Post": posting["auto_post"],
+                "Ready to Post": posting["ready_to_post"],
+                "Manual Hold": posting["manual_hold"],
+            }
+        )
+    st.session_state["automation_run"] = True
+    st.session_state["applied_actions"] = set(action_ids)
+    st.session_state["automation_log"] = log_entries
+    st.session_state["automation_summary"] = {
+        "forecast": scenario["score"]["continuous_close_days"],
+        "score": scenario["score"]["readiness_score"],
+        "auto_post": posting["auto_post"],
+        "ready_to_post": posting["ready_to_post"],
+        "manual_hold": posting["manual_hold"],
+    }
 
 
 def apply_theme():
@@ -413,11 +504,25 @@ def apply_theme():
             font-weight: 800;
             margin: 0.3rem 0 0.2rem 0;
             color: var(--brand);
+            text-align: center;
+            display: block;
         }
 
         .kpi-tile-copy {
             font-size: 0.78rem;
             color: var(--muted);
+        }
+
+        .kpi-tile-value.tone-risk {
+            color: var(--risk);
+        }
+
+        .kpi-tile-value.tone-warn {
+            color: var(--accent);
+        }
+
+        .kpi-tile-value.tone-good {
+            color: var(--good);
         }
 
         .intel-band {
@@ -543,6 +648,50 @@ def apply_theme():
             margin-top: 0.4rem;
         }
 
+        .queue-row {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            border: 1px solid rgba(20, 54, 66, 0.12);
+            padding: 0.9rem 1.1rem;
+            margin-bottom: 1.2rem;
+            box-shadow: 0 12px 28px rgba(15, 31, 44, 0.06);
+        }
+
+        .queue-title {
+            font-weight: 800;
+            color: var(--ink);
+            margin-bottom: 0.6rem;
+        }
+
+        .area-card.compact {
+            padding: 0.7rem 0.85rem;
+            border-radius: 16px;
+        }
+
+        .area-card.compact .area-headline {
+            font-size: 0.88rem;
+        }
+
+        .area-card.compact .area-subheadline,
+        .area-card.compact .area-insight {
+            display: none;
+        }
+
+        .snapshot-block {
+            background: rgba(255, 255, 255, 0.96);
+            border-radius: 20px;
+            border: 1px solid rgba(20, 54, 66, 0.12);
+            padding: 1rem 1.1rem;
+            box-shadow: 0 12px 28px rgba(15, 31, 44, 0.06);
+            margin-bottom: 1.2rem;
+        }
+
+        .snapshot-title {
+            font-weight: 800;
+            color: var(--ink);
+            margin-bottom: 0.6rem;
+        }
+
         .tracker-table-wrap {
             max-height: 720px;
             overflow: auto;
@@ -551,8 +700,9 @@ def apply_theme():
         .tracker-table thead th {
             position: sticky;
             top: 0;
-            background: rgba(248, 251, 252, 0.95);
-            z-index: 2;
+            background: #f8fbfc;
+            z-index: 3;
+            box-shadow: 0 2px 0 rgba(15, 31, 44, 0.08);
         }
 
         .tracker-table tbody tr:nth-child(even) {
@@ -604,6 +754,9 @@ def apply_theme():
             font-weight: 800;
             line-height: 1;
             margin-bottom: 0.5rem;
+            text-align: center;
+            display: block;
+            width: 100%;
         }
 
         .metric-subtitle {
@@ -1209,6 +1362,10 @@ def build_tracker_board_html(worklist, summary):
             "Next Action",
         ],
     ].copy()
+    display["Deadline Sort"] = pd.to_datetime(display["Deadline"], errors="coerce")
+    display = display.sort_values(
+        ["Step", "Deadline Sort"], ascending=[True, True], na_position="last"
+    ).drop(columns=["Deadline Sort"])
 
     for _, row in display.iterrows():
         rows.append(
@@ -1330,30 +1487,53 @@ def build_tracker_notes_html(handoff_queue):
 def format_display_frame(df):
     frame = df.copy()
     currency_label_overrides = {"Unresolved Difference", "Open AR Balance"}
+    percent_columns = []
     currency_columns = []
+    hours_columns = []
+    numeric_columns = []
 
     for column in frame.columns:
         if not pd.api.types.is_numeric_dtype(frame[column]):
             continue
-
-        if "(EUR)" in str(column) or column in currency_label_overrides:
+        col_name = str(column)
+        if "%" in col_name or "Rate" in col_name:
+            percent_columns.append(column)
+        elif "(EUR)" in col_name or column in currency_label_overrides:
             currency_columns.append(column)
+        elif "Hours" in col_name or "hrs" in col_name:
+            hours_columns.append(column)
+        else:
+            numeric_columns.append(column)
 
-    if not currency_columns:
+    if not (percent_columns or currency_columns or hours_columns or numeric_columns):
         return frame
 
+    formatters = {}
+    for column in percent_columns:
+        formatters[column] = lambda x: format_percent(x, 2)
+    for column in currency_columns:
+        formatters[column] = lambda x: format_number(x, 2)
+    for column in hours_columns:
+        formatters[column] = lambda x: format_number(x, 2)
+    for column in numeric_columns:
+        formatters[column] = lambda x: format_number(x, 0)
+
     return (
-        frame.style.format({column: "{:,.2f}" for column in currency_columns}, na_rep="")
-        .set_properties(subset=currency_columns, **{"text-align": "right"})
+        frame.style.format(formatters, na_rep="")
+        .set_properties(subset=frame.columns, **{"text-align": "right"})
     )
 
 
 def render_metric_card(title, value, subtitle, tone="medium"):
+    display_value = value
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        decimals = 2 if isinstance(value, (float, np.floating)) and not float(value).is_integer() else 0
+        display_value = format_number(value, decimals)
     st.markdown(
         f"""
         <div class="metric-card {tone}">
             <div class="metric-label">{title}</div>
-            <div class="metric-value">{value}</div>
+            <div class="metric-value">{display_value}</div>
             <div class="metric-subtitle">{subtitle}</div>
         </div>
         """,
@@ -1369,33 +1549,52 @@ def render_kpi_strip(summary):
     bank_total = summary["bank_total"]
     ai_candidates = summary["checklist_automation_candidates"]
 
+    def tone_class(value, warn_threshold=1, high_threshold=5, good_when_zero=True):
+        if good_when_zero and value == 0:
+            return "tone-good"
+        if value >= high_threshold:
+            return "tone-risk"
+        if value >= warn_threshold:
+            return "tone-warn"
+        return "tone-good"
+
+    pending_tone = tone_class(pending_actions, warn_threshold=1, high_threshold=4, good_when_zero=True)
+    risk_tone = tone_class(high_risk_items, warn_threshold=1, high_threshold=3, good_when_zero=True)
+    ai_tone = "tone-warn" if ai_candidates > 0 else "tone-good"
+    if match_rate >= 90:
+        match_tone = "tone-good"
+    elif match_rate >= 80:
+        match_tone = "tone-warn"
+    else:
+        match_tone = "tone-risk"
+
     st.markdown(
         f"""
         <div class="kpi-strip">
             <div class="kpi-tile">
                 <div class="kpi-tile-label">Close Day Target</div>
-                <div class="kpi-tile-value">4</div>
+                <div class="kpi-tile-value tone-good">4</div>
                 <div class="kpi-tile-copy">From 7 business days</div>
             </div>
             <div class="kpi-tile">
                 <div class="kpi-tile-label">Pending Actions</div>
-                <div class="kpi-tile-value">{pending_actions}</div>
-                <div class="kpi-tile-copy">{summary['not_started_tasks']} not started · {summary['blocked_tasks']} blocked</div>
+                <div class="kpi-tile-value {pending_tone}">{format_number(pending_actions, 0)}</div>
+                <div class="kpi-tile-copy">{format_number(summary['not_started_tasks'], 0)} not started · {format_number(summary['blocked_tasks'], 0)} blocked</div>
             </div>
             <div class="kpi-tile">
                 <div class="kpi-tile-label">High Risk Items</div>
-                <div class="kpi-tile-value">{high_risk_items}</div>
-                <div class="kpi-tile-copy">{summary['accrual_risks']} accruals · {summary['ap_3way_exceptions']} AP</div>
+                <div class="kpi-tile-value {risk_tone}">{format_number(high_risk_items, 0)}</div>
+                <div class="kpi-tile-copy">{format_number(summary['accrual_risks'], 0)} accruals · {format_number(summary['ap_3way_exceptions'], 0)} AP</div>
             </div>
             <div class="kpi-tile">
                 <div class="kpi-tile-label">Auto-Reconciled</div>
-                <div class="kpi-tile-value">{match_rate}%</div>
-                <div class="kpi-tile-copy">{bank_matched} of {bank_total} bank items</div>
+                <div class="kpi-tile-value {match_tone}">{format_percent(match_rate, 2)}</div>
+                <div class="kpi-tile-copy">{format_number(bank_matched, 0)} of {format_number(bank_total, 0)} bank items</div>
             </div>
             <div class="kpi-tile">
                 <div class="kpi-tile-label">AI Candidates</div>
-                <div class="kpi-tile-value">{ai_candidates}</div>
-                <div class="kpi-tile-copy">{summary['bank_journal_candidates']} bank drafts · {summary['journal_agent_ready_drafts']} journals</div>
+                <div class="kpi-tile-value {ai_tone}">{format_number(ai_candidates, 0)}</div>
+                <div class="kpi-tile-copy">{format_number(summary['bank_journal_candidates'], 0)} bank drafts · {format_number(summary['journal_agent_ready_drafts'], 0)} journals</div>
             </div>
         </div>
         """,
@@ -1535,6 +1734,88 @@ def render_focus_board(kpis, score, priorities):
     )
 
 
+def render_me_steps(kpis, actions):
+    automation_run = st.session_state.get("automation_run", False)
+    automation_summary = st.session_state.get("automation_summary", {})
+
+    st.markdown("<div class='section-label'>Month-End Steps</div>", unsafe_allow_html=True)
+    step_cols = st.columns(3, gap="medium")
+
+    with step_cols[0]:
+        st.markdown(
+            """
+            <div class="focus-card">
+                <div class="focus-title">Step 1 · Load the data</div>
+                <div class="focus-list">
+                    <div class="focus-item"><strong>Status:</strong> Data loaded and validated.</div>
+                    <div class="focus-item">Dataset ready for close review.</div>
+                </div>
+                <span class="focus-chip">Complete</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with step_cols[1]:
+        st.markdown(
+            """
+            <div class="focus-card">
+                <div class="focus-title">Step 2 · Run automations</div>
+                <div class="focus-list">
+                    <div class="focus-item"><strong>Status:</strong> Execute the automation bundle.</div>
+                    <div class="focus-item">Applies GL, bank, IC, journal, AP, and checklist automations.</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if automation_run:
+            st.button("Run all automations", key="me_run_all_disabled", use_container_width=True, disabled=True)
+            st.markdown("<span class='focus-chip'>Completed</span>", unsafe_allow_html=True)
+        else:
+            if st.button("Run all automations", key="me_run_all", use_container_width=True, type="primary"):
+                run_all_automations(kpis, actions)
+                safe_rerun()
+
+    with step_cols[2]:
+        status_line = "Pending" if not automation_run else "Ready"
+        forecast = automation_summary.get("forecast", "--")
+        st.markdown(
+            f"""
+            <div class="focus-card">
+                <div class="focus-title">Step 3 · Review & close</div>
+                <div class="focus-list">
+                    <div class="focus-item"><strong>Status:</strong> {status_line}</div>
+                    <div class="focus-item">Post-ready items and approve any remaining holds.</div>
+                </div>
+                <span class="focus-chip">Forecast: {forecast} days</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_action_queue(kpis):
+    queue = kpis["agents"]["action_queue"].copy()
+    if queue.empty:
+        return
+
+    st.markdown(
+        """
+        <div class="queue-row">
+            <div class="queue-title">Team Action Queue (next owner step)</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.dataframe(
+        format_display_frame(queue),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def render_area_card(area):
     metrics = [f"{label}: {value}" for label, value in area["metrics"].items()]
     st.markdown(
@@ -1553,6 +1834,86 @@ def render_area_card(area):
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_area_card_compact(area):
+    metrics = [f"{label}: {value}" for label, value in area["metrics"].items()]
+    st.markdown(
+        f"""
+        <div class="area-card compact">
+            <div class="area-header">
+                <div class="area-title">{area['label']}</div>
+                <div class="area-score">{area['severity_score']}</div>
+            </div>
+            <div class="area-headline">{area['headline']}</div>
+            {format_chip_row(metrics)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_agent_snapshot_tables(kpis):
+    cols = st.columns(2, gap="medium")
+    with cols[0]:
+        st.markdown("<div class='section-label'>GL approvals</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(kpis["agents"]["gl"]["worklist"].head(5)),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.markdown("<div class='section-label'>Bank exceptions</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(kpis["agents"]["bank"]["worklist"].head(5)),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.markdown("<div class='section-label'>IC exceptions</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(kpis["agents"]["ic"]["worklist"].head(5)),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with cols[1]:
+        st.markdown("<div class='section-label'>Journal drafts</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(kpis["agents"]["journal"]["erp_journal_drafts"].head(5)),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.markdown("<div class='section-label'>Checklist handoffs</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(kpis["agents"]["checklist"]["handoff_queue"].head(5)),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_before_after_snapshot(base_kpis, after_kpis, after_label):
+    focus_areas = ["gl", "bank", "intercompany", "accruals", "ap", "checklist"]
+    before_cols = st.columns(2, gap="large")
+
+    with before_cols[0]:
+        st.markdown("<div class='snapshot-block'>", unsafe_allow_html=True)
+        st.markdown("<div class='snapshot-title'>Before automation</div>", unsafe_allow_html=True)
+        area_cols = st.columns(2, gap="small")
+        for idx, key in enumerate(focus_areas):
+            with area_cols[idx % 2]:
+                render_area_card_compact(base_kpis["areas"][key])
+        st.markdown("<div class='section-label'>Agent tables</div>", unsafe_allow_html=True)
+        render_agent_snapshot_tables(base_kpis)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with before_cols[1]:
+        st.markdown("<div class='snapshot-block'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='snapshot-title'>After automation · {escape(after_label)}</div>", unsafe_allow_html=True)
+        area_cols = st.columns(2, gap="small")
+        for idx, key in enumerate(focus_areas):
+            with area_cols[idx % 2]:
+                render_area_card_compact(after_kpis["areas"][key])
+        st.markdown("<div class='section-label'>Agent tables</div>", unsafe_allow_html=True)
+        render_agent_snapshot_tables(after_kpis)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_priority_card(priority):
@@ -2251,9 +2612,12 @@ def render_chat(kpis, score, priorities):
 def render_command_center(kpis, score, priorities, commentary):
     summary = kpis["summary"]
     riskiest_entity = kpis["entities"][0]
+    actions = build_scenario_actions(kpis)
 
     render_kpi_strip(summary)
     render_focus_board(kpis, score, priorities)
+    render_me_steps(kpis, actions)
+    render_action_queue(kpis)
 
     st.markdown(
         f"""
@@ -3069,33 +3433,38 @@ def render_checklist_agent(kpis):
     )
 
     card_cols = st.columns(6, gap="medium")
+    blocked_tone = "low" if summary["blocked_tasks"] == 0 else "high"
+    waiting_tone = "low" if summary["waiting_tasks"] == 0 else "medium"
+    critical_tone = "low" if summary["critical_open_tasks"] == 0 else "high"
+    handoff_tone = "low" if summary["handoffs_at_risk"] == 0 else "medium"
+    automation_tone = "low" if summary["automation_candidates"] == 0 else "medium"
     with card_cols[0]:
         render_metric_card(
             "Blocked",
             str(summary["blocked_tasks"]),
             "Tasks that cannot move until a prior dependency is cleared.",
-            "high",
+            blocked_tone,
         )
     with card_cols[1]:
         render_metric_card(
             "Waiting on Input",
             str(summary["waiting_tasks"]),
             "Tasks stalled because the next owner is waiting for an upstream handoff.",
-            "medium",
+            waiting_tone,
         )
     with card_cols[2]:
         render_metric_card(
             "Critical Open",
             str(summary["critical_open_tasks"]),
             "Critical tasks still open on the close path.",
-            "high",
+            critical_tone,
         )
     with card_cols[3]:
         render_metric_card(
             "Handoffs at Risk",
             str(summary["handoffs_at_risk"]),
             "Open tasks with dependencies that can still break the close chain.",
-            "medium",
+            handoff_tone,
         )
     with card_cols[4]:
         render_metric_card(
@@ -3109,7 +3478,7 @@ def render_checklist_agent(kpis):
             "Automation Candidates",
             str(summary["automation_candidates"]),
             "Open checklist steps already showing high automation potential.",
-            "medium",
+            automation_tone,
         )
 
     st.markdown(
@@ -3178,41 +3547,54 @@ def render_checklist_agent(kpis):
 
 
 def render_agents_hub(kpis):
-    agent_options = {
-        "GL Approval Agent": render_gl_agent,
-        "Bank Reconciliation Agent": render_bank_agent,
-        "IC Reconciliation Agent": render_ic_agent,
-        "Journal Agent (JE)": render_journal_agent,
-        "Audit & Compliance Agent": render_audit_agent,
-        "Flux Analysis Agent": render_flux_agent,
-    }
-
     st.markdown(
         """
         <div class="entity-callout">
             <div class="section-label">Agents</div>
             <div class="entity-name">Operational agents for approvals, reconciliations, journals, and controls</div>
             <div class="entity-copy">
-                Use the selector below to move between the specialist agents without leaving the main navigation.
+                Use the sub-navigation below to move between the specialist agents without leaving the main navigation.
                 This keeps the top bar compact while preserving the full workflow across GL, bank, IC, journals, and audit.
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-    selected_agent = st.selectbox(
-        "Choose an agent view",
-        list(agent_options.keys()),
-        index=0,
+    agent_tabs = st.tabs(
+        [
+            "GL Approval",
+            "Bank",
+            "Intercompany",
+            "Journals",
+            "Audit",
+            "Flux",
+        ]
     )
-    agent_options[selected_agent](kpis)
+
+    with agent_tabs[0]:
+        render_gl_agent(kpis)
+    with agent_tabs[1]:
+        render_bank_agent(kpis)
+    with agent_tabs[2]:
+        render_ic_agent(kpis)
+    with agent_tabs[3]:
+        render_journal_agent(kpis)
+    with agent_tabs[4]:
+        render_audit_agent(kpis)
+    with agent_tabs[5]:
+        render_flux_agent(kpis)
 
 
 def render_scenario_lab(kpis, score):
     actions = build_scenario_actions(kpis)
     recommendations = build_below_four_recommendations(kpis)
     base_posting = kpis["agents"]["erp_posting"]
+    if "applied_actions" not in st.session_state:
+        st.session_state["applied_actions"] = set()
+    if "automation_log" not in st.session_state:
+        st.session_state["automation_log"] = []
+    if "automation_run" not in st.session_state:
+        st.session_state["automation_run"] = False
 
     st.markdown(
         f"""
@@ -3228,43 +3610,40 @@ def render_scenario_lab(kpis, score):
         unsafe_allow_html=True,
     )
 
-    selector_cols = st.columns(2, gap="medium")
-    selected_ids = []
-    for index, action in enumerate(actions):
-        checked = selector_cols[index % 2].checkbox(
-            f"{action['area']}: {action['title']}",
-            value=False,
-            key=f"scenario_action_{action['id']}",
-            help=action["description"],
-        )
-        if checked:
-            selected_ids.append(action["id"])
-
-    scenario = simulate_close_scenario(kpis, selected_ids)
-    delta_days = round(score["continuous_close_days"] - scenario["score"]["continuous_close_days"], 1)
-    posting = scenario["posting_simulator"] if selected_ids else base_posting
+    plan_ids = [action["id"] for action in actions]
+    plan_scenario = simulate_close_scenario(kpis, plan_ids)
+    delta_days = round(score["continuous_close_days"] - plan_scenario["score"]["continuous_close_days"], 1)
+    posting = plan_scenario["posting_simulator"]
+    automation_run = st.session_state.get("automation_run", False)
 
     metric_cols = st.columns(5, gap="medium")
     with metric_cols[0]:
         render_metric_card("Base Forecast", f"{score['continuous_close_days']} days", "Continuous current-state close forecast.", "medium")
     with metric_cols[1]:
-        render_metric_card("Scenario Forecast", f"{scenario['score']['continuous_close_days']} days", "Forecast after selected actions are applied.", "low" if scenario["gets_below_four"] else "medium")
+        render_metric_card("Automation Forecast", f"{plan_scenario['score']['continuous_close_days']} days", "Forecast after running the automation bundle.", "low" if plan_scenario["gets_below_four"] else "medium")
     with metric_cols[2]:
         render_metric_card("Delta", f"{delta_days} days", "Reduction from the current continuous close forecast.", "low" if delta_days > 0 else "medium")
     with metric_cols[3]:
-        render_metric_card("Scenario Score", f"{scenario['score']['readiness_score']}/100", "Readiness score after the selected actions.", "low" if scenario["score"]["readiness_score"] >= 80 else "medium")
+        render_metric_card("Automation Score", f"{plan_scenario['score']['readiness_score']}/100", "Readiness score after the automation bundle.", "low" if plan_scenario["score"]["readiness_score"] >= 80 else "medium")
     with metric_cols[4]:
-        render_metric_card("Hours Saved", f"{scenario['total_hours_saved']} hrs", "Recovered effort from the selected automation bundle.", "low")
+        render_metric_card("Hours Saved", f"{plan_scenario['total_hours_saved']} hrs", "Recovered effort from the automation bundle.", "low")
 
-    if selected_ids:
-        status_text = "Below 4 days" if scenario["gets_below_four"] else "Still above 4 days"
-        status_tone = "low" if scenario["gets_below_four"] else "high"
-        render_metric_card(
-            "Scenario Status",
-            status_text,
-            f"Gap to target: {scenario['score']['continuous_gap_to_target_days']} days",
-            status_tone,
-        )
+    status_text = "Below 4 days" if plan_scenario["gets_below_four"] else "Still above 4 days"
+    status_tone = "low" if plan_scenario["gets_below_four"] else "high"
+    render_metric_card(
+        "Automation Status",
+        status_text,
+        f"Gap to target: {plan_scenario['score']['continuous_gap_to_target_days']} days",
+        status_tone,
+    )
+
+    st.markdown("<div class='section-label'>Automation Execution</div>", unsafe_allow_html=True)
+    applied_panel = (
+        f"{plan_scenario['score']['continuous_close_days']} days · {len(plan_ids)} actions applied"
+        if automation_run
+        else "Automation bundle not yet executed. Run the bundle from Command Centre Step 2."
+    )
+    st.info(f"Applied automation state: {applied_panel}")
 
     posting_cols = st.columns(4, gap="medium")
     with posting_cols[0]:
@@ -3343,6 +3722,25 @@ def render_scenario_lab(kpis, score):
             use_container_width=True,
             hide_index=True,
         )
+
+    if st.session_state["automation_log"]:
+        st.markdown("<div class='section-label'>Automation Run Sheet</div>", unsafe_allow_html=True)
+        st.dataframe(
+            format_display_frame(pd.DataFrame(st.session_state["automation_log"])),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("<div class='section-label'>Automation Bundle</div>", unsafe_allow_html=True)
+    st.dataframe(
+        format_display_frame(pd.DataFrame(actions)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("<div class='section-label'>Before / After Impact</div>", unsafe_allow_html=True)
+    after_label = "Applied" if automation_run else "Projected"
+    render_before_after_snapshot(kpis, plan_scenario["kpis"], after_label)
 
     st.markdown("<div class='section-label'>Recommended Bundles Below 4 Days</div>", unsafe_allow_html=True)
     st.dataframe(
@@ -3532,7 +3930,7 @@ def render_app_header(kpis):
             )
         with ask_col:
             if st.button("Ask AI", key="ask_ai_button", use_container_width=True):
-                st.session_state["nav_radio"] = "AI Copilot"
+                st.session_state["nav_target"] = "AI Copilot"
                 safe_rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -3552,12 +3950,25 @@ with st.sidebar:
     if not HAS_PLOTLY:
         st.warning("`plotly` is not installed in this environment. The app will fall back to native Streamlit charts.")
 
-data, kpis, score, priorities, commentary = prepare(data_source)
-reset_copilot_if_needed(dataset_key_for(data_source), kpis, score, priorities)
+data, base_kpis, base_score, base_priorities, base_commentary = prepare(data_source)
+reset_copilot_if_needed(dataset_key_for(data_source), base_kpis, base_score, base_priorities)
 
 with st.sidebar:
     st.markdown("### Accounting Period")
-    st.write(kpis["summary"]["accounting_period_label"])
+    st.write(base_kpis["summary"]["accounting_period_label"])
+
+if st.session_state.get("automation_run"):
+    automation_actions = build_scenario_actions(base_kpis)
+    applied = simulate_close_scenario(base_kpis, [action["id"] for action in automation_actions])
+    kpis = applied["kpis"]
+    score = applied["score"]
+    priorities = priority_engine(kpis)
+    commentary = generate_commentary(kpis, score)
+else:
+    kpis = base_kpis
+    score = base_score
+    priorities = base_priorities
+    commentary = base_commentary
 
 render_app_header(kpis)
 
@@ -3593,7 +4004,7 @@ with tab_map["Risks"]:
     render_entity_view(kpis)
 
 with tab_map["Scenarios"]:
-    render_scenario_lab(kpis, score)
+    render_scenario_lab(base_kpis, base_score)
 
 with tab_map["Priorities"]:
     render_priority_engine(priorities)

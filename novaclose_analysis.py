@@ -630,6 +630,209 @@ def _build_flux_agent(tb, gl, accruals, apar):
             ["Entity", "Account Name", "Variance (EUR)", "MoM %", "YoY %", "Anomaly Reason", "Context Cues"],
         ].copy(),
     }
+
+
+def _apply_gl_actions(gl_agent, selected_ids):
+    updated = deepcopy(gl_agent)
+    worklist = updated["worklist"].copy()
+    if worklist.empty:
+        return updated
+
+    if "gl_straight_through" in selected_ids:
+        worklist = worklist.loc[~worklist["Approval Lane"].eq("Straight-through")].copy()
+
+    if "gl_fast_track_controller" in selected_ids:
+        manager_rows = worklist.loc[worklist["Approval Lane"].eq("Manager queue")]
+        controller_rows = worklist.loc[worklist["Approval Lane"].eq("Controller queue")]
+        remove_ids = set(manager_rows["Journal Entry ID"].tolist())
+        remove_ids.update(controller_rows["Journal Entry ID"].head(20).tolist())
+        worklist = worklist.loc[~worklist["Journal Entry ID"].isin(remove_ids)].copy()
+
+    updated["worklist"] = worklist
+    updated["approval_ready"] = worklist.loc[worklist["Approval Lane"].eq("Straight-through")].copy()
+    updated["approval_packets"] = worklist.loc[
+        worklist["Approval Lane"].isin(["Manager queue", "Controller queue", "CFO queue"])
+    ].copy()
+    updated["lane_breakdown"] = (
+        worklist["Approval Lane"]
+        .value_counts()
+        .reindex(["Straight-through", "Manager queue", "Controller queue", "CFO queue"], fill_value=0)
+        .rename_axis("Approval Lane")
+        .reset_index(name="Count")
+    )
+    updated["entity_breakdown"] = (
+        worklist["Entity"].value_counts().rename_axis("Entity").reset_index(name="Pending Items")
+    )
+
+    updated["summary"] = {
+        "pending_items": int(worklist.shape[0]),
+        "straight_through_candidates": int(worklist["Approval Lane"].eq("Straight-through").sum()),
+        "manager_queue": int(worklist["Approval Lane"].eq("Manager queue").sum()),
+        "controller_queue": int(worklist["Approval Lane"].eq("Controller queue").sum()),
+        "cfo_queue": int(worklist["Approval Lane"].eq("CFO queue").sum()),
+        "manual_high_risk": int(
+            worklist["Source"].eq("Manual Entry").sum()
+            + worklist["Intercompany"].eq("Yes").sum()
+        ),
+        "erp_ready_after_approval": int(updated["approval_ready"].shape[0]),
+        "recoverable_hours": int(min(12, round(updated["approval_ready"].shape[0] * 0.3 + 3))),
+    }
+    return updated
+
+
+def _apply_bank_actions(bank_agent, selected_ids):
+    updated = deepcopy(bank_agent)
+    worklist = updated["worklist"].copy()
+    if worklist.empty:
+        return updated
+
+    if "bank_auto_clear" in selected_ids:
+        worklist = worklist.loc[
+            ~worklist["Action Bucket"].isin(["Auto-clear next month", "Journal candidate"])
+        ].copy()
+
+    updated["worklist"] = worklist
+    updated["status_breakdown"] = (
+        worklist["Match Status"]
+        .value_counts()
+        .rename_axis("Match Status")
+        .reset_index(name="Count")
+    )
+    updated["entity_breakdown"] = (
+        worklist["Entity"].value_counts().rename_axis("Entity").reset_index(name="Open Items")
+    )
+    updated["summary"] = {
+        "open_items": int(worklist.shape[0]),
+        "auto_clear_candidates": int(worklist["Action Bucket"].eq("Auto-clear next month").sum()),
+        "journal_candidates": int(worklist["Action Bucket"].eq("Journal candidate").sum()),
+        "escalations": int(worklist["Action Bucket"].eq("Escalate").sum()),
+        "manual_investigations": int(worklist["Action Bucket"].eq("Manual investigation").sum()),
+        "statement_break_value": 0.0 if worklist.empty else updated["summary"]["statement_break_value"],
+        "largest_difference": float(worklist["Difference (EUR)"].abs().max()) if not worklist.empty else 0.0,
+    }
+    return updated
+
+
+def _apply_ic_actions(ic_agent, selected_ids):
+    updated = deepcopy(ic_agent)
+    worklist = updated["worklist"].copy()
+    if worklist.empty:
+        return updated
+
+    if "ic_post_drafts" in selected_ids:
+        worklist = worklist.loc[~worklist["Issue Type"].isin(["FX mismatch", "Elimination variance"])].copy()
+
+    updated["worklist"] = worklist
+    updated["issue_breakdown"] = (
+        worklist["Issue Type"].value_counts().rename_axis("Issue Type").reset_index(name="Count")
+    )
+    updated["summary"]["open_exceptions"] = int(
+        worklist["Issue Type"].isin(["FX mismatch", "Elimination variance"]).sum()
+    )
+    updated["summary"]["fx_mismatches"] = int(worklist["Issue Type"].eq("FX mismatch").sum())
+    updated["summary"]["elimination_drafts"] = max(0, updated["summary"]["open_exceptions"])
+    updated["summary"]["unresolved_difference"] = 0.0 if updated["summary"]["open_exceptions"] == 0 else updated["summary"]["unresolved_difference"]
+    return updated
+
+
+def _apply_journal_actions(journal_agent, selected_ids):
+    updated = deepcopy(journal_agent)
+    if "journal_post_ready" not in selected_ids:
+        return updated
+
+    worklist = updated["worklist"].copy()
+    worklist = worklist.loc[~worklist["Approval Status"].eq("Draft - Ready for ERP")].copy()
+    updated["worklist"] = worklist
+    updated["erp_journal_drafts"] = pd.DataFrame(columns=updated["erp_journal_drafts"].columns)
+    updated["summary"]["erp_ready_drafts"] = 0
+    updated["summary"]["contract_backed_drafts"] = 0
+    updated["summary"]["standard_reclasses"] = 0
+    updated["summary"]["review_needed"] = int((worklist["Approval Status"] == "Draft - Review Needed").sum())
+    updated["entity_breakdown"] = pd.DataFrame(columns=updated["entity_breakdown"].columns)
+    updated["type_breakdown"] = (
+        worklist["JE Type"].value_counts().rename_axis("JE Type").reset_index(name="Count")
+    )
+    return updated
+
+
+def _apply_checklist_actions(checklist_agent, summary):
+    updated = deepcopy(checklist_agent)
+    worklist = updated["worklist"].copy()
+    if worklist.empty:
+        return updated
+
+    if summary.get("blocked_tasks", 0) == 0:
+        worklist = worklist.loc[~worklist["Status"].eq("Blocked")].copy()
+    if summary.get("waiting_tasks", 0) == 0:
+        worklist = worklist.loc[~worklist["Status"].eq("Waiting on Input")].copy()
+
+    updated["worklist"] = worklist
+    updated["handoff_queue"] = updated["handoff_queue"].loc[
+        updated["handoff_queue"]["Status"].isin(["Blocked", "Waiting on Input", "Not Started", "In Progress"])
+    ].copy()
+    updated["critical_path"] = updated["critical_path"].loc[
+        updated["critical_path"]["Status"].isin(["Blocked", "Waiting on Input", "Not Started", "In Progress"])
+    ].copy()
+    updated["summary"]["blocked_tasks"] = summary.get("blocked_tasks", updated["summary"]["blocked_tasks"])
+    updated["summary"]["waiting_tasks"] = summary.get("waiting_tasks", updated["summary"]["waiting_tasks"])
+    updated["summary"]["critical_open_tasks"] = summary.get(
+        "critical_open_tasks", updated["summary"]["critical_open_tasks"]
+    )
+    updated["summary"]["handoffs_at_risk"] = int(updated["handoff_queue"].shape[0])
+    updated["summary"]["recoverable_hours"] = summary.get(
+        "checklist_recoverable_hours", updated["summary"]["recoverable_hours"]
+    )
+    return updated
+
+
+def _apply_summary_to_areas(summary, areas):
+    updated = deepcopy(areas)
+    updated["gl"]["metrics"]["Pending GL"] = summary["pending_gl"]
+    updated["gl"]["metrics"]["Manual JEs"] = summary["manual_jes"]
+    updated["gl"]["severity_score"] = _clamp((summary["pending_gl"] / 175) * 70 + (summary["manual_jes"] / 70) * 30)
+    updated["gl"]["headline"] = f"{summary['pending_gl']} journals pending review or approval"
+    updated["gl"]["subheadline"] = f"{summary['manual_jes']} manual journal entries still need extra scrutiny"
+
+    bank_match_rate = float(safe_pct(summary["bank_total"] - summary["bank_exceptions"], summary["bank_total"]))
+    updated["bank"]["metrics"]["Exceptions"] = summary["bank_exceptions"]
+    updated["bank"]["metrics"]["Stale Items"] = summary["bank_stale"]
+    updated["bank"]["metrics"]["Match Rate %"] = bank_match_rate
+    updated["bank"]["severity_score"] = _clamp((summary["bank_exceptions"] / 12) * 70 + (summary["bank_stale"] / 4) * 30)
+    updated["bank"]["headline"] = f"{summary['bank_exceptions']} cash exceptions still need investigation"
+    updated["bank"]["subheadline"] = f"{bank_match_rate}% match rate with {summary['bank_stale']} stale items over 30 days"
+
+    updated["intercompany"]["metrics"]["IC Exceptions"] = summary["ic_exceptions"]
+    updated["intercompany"]["metrics"]["Unresolved Difference"] = summary["ic_total_diff"]
+    updated["intercompany"]["severity_score"] = _clamp((summary["ic_exceptions"] / 2) * 70 + min(summary["ic_total_diff"] / 6000, 1) * 30)
+    updated["intercompany"]["headline"] = f"{summary['ic_exceptions']} intercompany elimination gaps remain open"
+    updated["intercompany"]["subheadline"] = f"{_format_currency(summary['ic_total_diff'])} unresolved across elimination exceptions"
+
+    updated["accruals"]["metrics"]["Action Items"] = summary["accrual_risks"]
+    updated["accruals"]["metrics"]["Missing Support"] = summary["accrual_missing_docs"]
+    updated["accruals"]["metrics"]["High Risk"] = summary["high_risk_accruals"]
+    updated["accruals"]["severity_score"] = _clamp(
+        (summary["accrual_risks"] / 10) * 70 + (summary["accrual_missing_docs"] / 3) * 20 + (summary["high_risk_accruals"] / 5) * 10
+    )
+    updated["accruals"]["headline"] = f"{summary['accrual_risks']} accruals require action before close"
+    updated["accruals"]["subheadline"] = f"{summary['accrual_missing_docs']} are missing support and {summary['high_risk_accruals']} are high risk"
+
+    updated["ap"]["metrics"]["3-Way Exceptions"] = summary["ap_3way_exceptions"]
+    updated["ap"]["metrics"]["AP Approval Friction"] = summary["ap_disputed"]
+    updated["ap"]["severity_score"] = _clamp((summary["ap_3way_exceptions"] / 10) * 70 + (summary["ap_disputed"] / 15) * 30)
+    updated["ap"]["headline"] = f"{summary['ap_3way_exceptions']} AP items are outside clean 3-way match"
+    updated["ap"]["subheadline"] = f"{summary['ap_disputed']} AP documents are disputed, on hold, or pending approval"
+
+    updated["checklist"]["metrics"]["Blocked"] = summary["blocked_tasks"]
+    updated["checklist"]["metrics"]["Waiting"] = summary["waiting_tasks"]
+    updated["checklist"]["metrics"]["Critical Open"] = summary["critical_open_tasks"]
+    updated["checklist"]["severity_score"] = _clamp(
+        (summary["blocked_tasks"] / 3) * 50
+        + (summary["waiting_tasks"] / 3) * 20
+        + (summary["critical_open_tasks"] / 7) * 30
+    )
+    updated["checklist"]["headline"] = f"{summary['blocked_tasks']} checklist tasks are blocked and {summary['waiting_tasks']} are waiting on input"
+    updated["checklist"]["subheadline"] = f"{summary['critical_open_tasks']} critical tasks are still open across the close workflow"
+    return updated
     if "Step " in text:
         text = text.split("Step ", 1)[1]
     try:
@@ -650,6 +853,41 @@ def _count_open_downstream(step, children_by_step, open_steps, memo):
 
     memo[step] = total
     return total
+
+
+def _build_action_queue(checklist):
+    frame = checklist.copy()
+    open_mask = frame["Status"].isin(["Blocked", "Waiting on Input", "Not Started", "In Progress"])
+    open_tasks = frame.loc[open_mask].copy()
+    if open_tasks.empty:
+        return pd.DataFrame(columns=["Owner", "Task", "Deadline", "Status", "Priority", "Category"])
+
+    status_rank = {
+        "Blocked": 0,
+        "Waiting on Input": 1,
+        "In Progress": 2,
+        "Not Started": 3,
+    }
+    priority_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+
+    open_tasks["Status Rank"] = open_tasks["Status"].map(status_rank).fillna(4)
+    open_tasks["Priority Rank"] = open_tasks["Priority"].map(priority_rank).fillna(4)
+    open_tasks["Deadline Sort"] = pd.to_datetime(open_tasks["Deadline"], errors="coerce")
+
+    open_tasks = open_tasks.sort_values(
+        ["Status Rank", "Priority Rank", "Deadline Sort"], ascending=[True, True, True]
+    )
+
+    top_tasks = (
+        open_tasks.groupby("Owner / Responsible", dropna=False)
+        .head(1)
+        .rename(columns={"Owner / Responsible": "Owner"})
+    )
+
+    return top_tasks.loc[
+        :,
+        ["Owner", "Task", "Deadline", "Status", "Priority", "Category"],
+    ].head(5)
 
 
 def _ic_pair_label(row):
@@ -2011,6 +2249,7 @@ def calculate_kpis(data):
     journal_agent = _build_journal_agent(accruals)
     audit_agent = _build_audit_agent(bank_agent, ic_agent, journal_agent)
     checklist_agent = _build_checklist_agent(checklist)
+    action_queue = _build_action_queue(checklist)
     flux_agent = _build_flux_agent(tb, gl, accruals, apar)
 
     ic_exception_mask = ~ic["Elimination Status"].eq("Eliminated")
@@ -2313,6 +2552,7 @@ def calculate_kpis(data):
         "checklist_handoffs_at_risk": checklist_agent["summary"]["handoffs_at_risk"],
         "checklist_recoverable_hours": checklist_agent["summary"]["recoverable_hours"],
         "checklist_automation_candidates": checklist_agent["summary"]["automation_candidates"],
+        "action_queue_count": int(action_queue.shape[0]),
         "ic_exceptions": ic_exceptions,
         "ic_total_diff": round(ic_total_diff, 2),
         "accrual_risks": accrual_risks,
@@ -2354,6 +2594,7 @@ def calculate_kpis(data):
             "audit": audit_agent,
             "checklist": checklist_agent,
             "flux": flux_agent,
+            "action_queue": action_queue,
         },
     }
 
@@ -2867,12 +3108,58 @@ def simulate_close_scenario(kpis, selected_action_ids):
     if "ap_exception_sweep" in selected_ids:
         summary["ap_3way_exceptions"] = max(0, summary["ap_3way_exceptions"] - 4)
 
+    summary["bank_match_rate"] = float(
+        safe_pct(summary.get("bank_total", 0) - summary["bank_exceptions"], summary.get("bank_total", 0))
+    )
+
+    scenario["agents"]["gl"] = _apply_gl_actions(scenario["agents"]["gl"], selected_ids)
+    scenario["agents"]["bank"] = _apply_bank_actions(scenario["agents"]["bank"], selected_ids)
+    scenario["agents"]["ic"] = _apply_ic_actions(scenario["agents"]["ic"], selected_ids)
+    scenario["agents"]["journal"] = _apply_journal_actions(scenario["agents"]["journal"], selected_ids)
+    scenario["agents"]["checklist"] = _apply_checklist_actions(scenario["agents"]["checklist"], summary)
+    scenario["agents"]["audit"] = _build_audit_agent(
+        scenario["agents"]["bank"], scenario["agents"]["ic"], scenario["agents"]["journal"]
+    )
+
+    summary["pending_gl"] = scenario["agents"]["gl"]["summary"]["pending_items"]
+    summary["bank_exceptions"] = scenario["agents"]["bank"]["summary"]["open_items"]
+    summary["ic_exceptions"] = scenario["agents"]["ic"]["summary"]["open_exceptions"]
+    if summary["ic_exceptions"] == 0:
+        summary["ic_total_diff"] = 0.0
+
+    summary["gl_straight_through_candidates"] = scenario["agents"]["gl"]["summary"]["straight_through_candidates"]
+    summary["gl_manager_queue"] = scenario["agents"]["gl"]["summary"]["manager_queue"]
+    summary["gl_controller_queue"] = scenario["agents"]["gl"]["summary"]["controller_queue"]
+    summary["gl_cfo_queue"] = scenario["agents"]["gl"]["summary"]["cfo_queue"]
+    summary["gl_approval_recoverable_hours"] = scenario["agents"]["gl"]["summary"]["recoverable_hours"]
+    summary["bank_auto_clear_candidates"] = scenario["agents"]["bank"]["summary"]["auto_clear_candidates"]
+    summary["bank_journal_candidates"] = scenario["agents"]["bank"]["summary"]["journal_candidates"]
+    summary["bank_escalations"] = scenario["agents"]["bank"]["summary"]["escalations"]
+    summary["bank_manual_investigations"] = scenario["agents"]["bank"]["summary"]["manual_investigations"]
+    summary["ic_auto_matched"] = scenario["agents"]["ic"]["summary"]["auto_matched"]
+    summary["ic_fx_mismatches"] = scenario["agents"]["ic"]["summary"]["fx_mismatches"]
+    summary["ic_elimination_drafts"] = scenario["agents"]["ic"]["summary"]["elimination_drafts"]
+    summary["ic_tp_flags"] = scenario["agents"]["ic"]["summary"]["tp_flags"]
+    summary["journal_agent_ready_drafts"] = scenario["agents"]["journal"]["summary"]["erp_ready_drafts"]
+    summary["journal_agent_review_needed"] = scenario["agents"]["journal"]["summary"]["review_needed"]
+    summary["audit_drafts_reviewed"] = scenario["agents"]["audit"]["summary"]["drafts_reviewed"]
+    summary["audit_ready_to_post"] = scenario["agents"]["audit"]["summary"]["ready_to_post"]
+    summary["audit_conditional"] = scenario["agents"]["audit"]["summary"]["conditional_approval"]
+    summary["audit_blocked"] = scenario["agents"]["audit"]["summary"]["blocked_for_review"]
+    summary["audit_avg_control_score"] = scenario["agents"]["audit"]["summary"]["average_control_score"]
+    summary["checklist_handoffs_at_risk"] = scenario["agents"]["checklist"]["summary"]["handoffs_at_risk"]
+    summary["checklist_recoverable_hours"] = scenario["agents"]["checklist"]["summary"]["recoverable_hours"]
+    summary["checklist_automation_candidates"] = scenario["agents"]["checklist"]["summary"]["automation_candidates"]
+
+    scenario["areas"] = _apply_summary_to_areas(summary, scenario["areas"])
+
     score = calculate_readiness_score(scenario)
     selected_actions = [action for action in build_scenario_actions(kpis) if action["id"] in selected_ids]
     total_hours_saved = sum(action["hours_saved"] for action in selected_actions)
     posting_simulator = build_erp_posting_simulator(kpis, selected_ids)
 
     return {
+        "kpis": scenario,
         "selected_actions": selected_actions,
         "score": score,
         "total_hours_saved": total_hours_saved,
