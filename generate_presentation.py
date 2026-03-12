@@ -146,6 +146,54 @@ def add_bullets(slide, left, top, width, height, lines, title=None):
         p.space_after = Pt(8)
 
 
+def add_tool_card(slide, left, top, width, height, badge_text, badge_fill, tool_name, tool_use):
+    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, width, height)
+    card.fill.solid()
+    card.fill.fore_color.rgb = WHITE
+    card.line.color.rgb = LINE
+    card.line.width = Pt(1)
+
+    badge = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+        left + Inches(0.18),
+        top + Inches(0.18),
+        Inches(0.72),
+        Inches(0.72),
+    )
+    badge.fill.solid()
+    badge.fill.fore_color.rgb = badge_fill
+    badge.line.color.rgb = badge_fill
+
+    badge_tf = badge.text_frame
+    badge_tf.clear()
+    p = badge_tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER
+    run = p.add_run()
+    run.text = badge_text
+    run.font.size = Pt(18)
+    run.font.bold = True
+    run.font.color.rgb = WHITE
+
+    title_box = slide.shapes.add_textbox(left + Inches(1.05), top + Inches(0.2), width - Inches(1.25), Inches(0.3))
+    title_frame = title_box.text_frame
+    title_frame.clear()
+    p = title_frame.paragraphs[0]
+    run = p.add_run()
+    run.text = tool_name
+    run.font.size = Pt(16)
+    run.font.bold = True
+    run.font.color.rgb = INK
+
+    body_box = slide.shapes.add_textbox(left + Inches(1.05), top + Inches(0.55), width - Inches(1.25), Inches(0.62))
+    body_frame = body_box.text_frame
+    body_frame.clear()
+    p = body_frame.paragraphs[0]
+    run = p.add_run()
+    run.text = tool_use
+    run.font.size = Pt(11)
+    run.font.color.rgb = MUTED
+
+
 def build_deck():
     data = load_data(str(DATASET))
     kpis = calculate_kpis(data)
@@ -323,6 +371,30 @@ def build_deck():
     # Slide 5
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide)
+    add_title(slide, "Tools used to build the app", "The prototype was built with a lightweight analytics and demo stack that is easy to explain and scale.")
+    tool_cards = [
+        ("Py", RGBColor(53, 114, 165), "Python", "Core analysis engine, agent logic, scenario model, and orchestration."),
+        ("st", RGBColor(255, 75, 75), "Streamlit", "Interactive demo application, command centre UI, and guided month-end workflow."),
+        ("pd", RGBColor(21, 99, 85), "Pandas", "Workbook shaping, KPI calculations, exception analysis, and agent worklists."),
+        ("pl", RGBColor(99, 110, 250), "Plotly", "Readiness gauges, risk charts, and clean presentation visuals inside the app."),
+        ("xl", RGBColor(33, 115, 70), "OpenPyXL / Excel", "Reads the month-end workbook and preserves the finance-team operating model."),
+        ("AI", PURPLE, "Local AI Copilot Logic", "Deterministic prompt routing, commentary drafting, and finance-ready narrative outputs."),
+    ]
+    tool_positions = [
+        (Inches(0.8), Inches(1.55)),
+        (Inches(6.65), Inches(1.55)),
+        (Inches(0.8), Inches(3.0)),
+        (Inches(6.65), Inches(3.0)),
+        (Inches(0.8), Inches(4.45)),
+        (Inches(6.65), Inches(4.45)),
+    ]
+    for (badge_text, badge_fill, tool_name, tool_use), (left, top) in zip(tool_cards, tool_positions):
+        add_tool_card(slide, left, top, Inches(5.7), Inches(1.15), badge_text, badge_fill, tool_name, tool_use)
+    add_footer(slide, "NovaClose | Build stack")
+
+    # Slide 6
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide)
     add_title(slide, "Agent suite", "Each agent owns a specific part of the close and feeds a common readiness and posting model.")
     agent_rows = [
         ("GL Approval Agent", "Triages pending journals into straight-through, manager, controller, and CFO lanes."),
@@ -344,7 +416,7 @@ def build_deck():
     )
     add_footer(slide, "NovaClose | Agent architecture")
 
-    # Slide 6
+    # Slide 7
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide)
     add_title(slide, "Automation bundle and control transparency", "One controlled bundle runs in the app, with an audit trail on what changed and what still needs release.")
@@ -367,7 +439,7 @@ def build_deck():
     )
     add_footer(slide, "NovaClose | Automation controls")
 
-    # Slide 7
+    # Slide 8
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide)
     add_title(slide, "How the CFO and operations team use it", "The app is designed to answer three questions fast: Where are we? What moved? What do we do next?")
@@ -398,7 +470,7 @@ def build_deck():
     )
     add_footer(slide, "NovaClose | Operating model")
 
-    # Slide 8
+    # Slide 9
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide)
     add_title(slide, "Business impact and demo message", "Use this slide as the closing narrative in the hackathon pitch.")

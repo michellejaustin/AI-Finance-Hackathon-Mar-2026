@@ -757,31 +757,41 @@ def _apply_journal_actions(journal_agent, selected_ids):
 
 def _apply_checklist_actions(checklist_agent, summary):
     updated = deepcopy(checklist_agent)
-    worklist = updated["worklist"].copy()
-    if worklist.empty:
+    all_tasks = updated.get("all_tasks", pd.DataFrame()).copy()
+    if all_tasks.empty:
         return updated
 
-    if summary.get("blocked_tasks", 0) == 0:
-        worklist = worklist.loc[~worklist["Status"].eq("Blocked")].copy()
-    if summary.get("waiting_tasks", 0) == 0:
-        worklist = worklist.loc[~worklist["Status"].eq("Waiting on Input")].copy()
+    target_blocked = int(summary.get("blocked_tasks", int(all_tasks["Status"].eq("Blocked").sum())))
+    target_waiting = int(summary.get("waiting_tasks", int(all_tasks["Status"].eq("Waiting on Input").sum())))
 
-    updated["worklist"] = worklist
-    updated["handoff_queue"] = updated["handoff_queue"].loc[
-        updated["handoff_queue"]["Status"].isin(["Blocked", "Waiting on Input", "Not Started", "In Progress"])
-    ].copy()
-    updated["critical_path"] = updated["critical_path"].loc[
-        updated["critical_path"]["Status"].isin(["Blocked", "Waiting on Input", "Not Started", "In Progress"])
-    ].copy()
+    blocked_index = all_tasks.loc[all_tasks["Status"].eq("Blocked")].sort_values("Step").index.tolist()
+    for idx in blocked_index[target_blocked:]:
+        all_tasks.at[idx, "Status"] = "In Progress"
+
+    waiting_index = all_tasks.loc[all_tasks["Status"].eq("Waiting on Input")].sort_values("Step").index.tolist()
+    for idx in waiting_index[target_waiting:]:
+        all_tasks.at[idx, "Status"] = "In Progress"
+
+    for idx, row in all_tasks.iterrows():
+        action_lane, next_action, unblock_score = _checklist_action_fields(
+            str(row["Status"]),
+            str(row["Priority"]),
+            str(row["Owner"]),
+            str(row["Dependency Task"]),
+            str(row["Dependency Owner"]),
+            int(pd.to_numeric(row["Downstream Open Tasks"], errors="coerce") or 0),
+            float(pd.to_numeric(row["Estimated Hours"], errors="coerce") or 0),
+        )
+        all_tasks.at[idx, "Action Lane"] = action_lane
+        all_tasks.at[idx, "Next Action"] = next_action
+        all_tasks.at[idx, "Unblock Score"] = unblock_score
+
+    rebuilt = _derive_checklist_views(all_tasks)
+    updated.update(rebuilt)
     updated["summary"]["blocked_tasks"] = summary.get("blocked_tasks", updated["summary"]["blocked_tasks"])
     updated["summary"]["waiting_tasks"] = summary.get("waiting_tasks", updated["summary"]["waiting_tasks"])
-    updated["summary"]["critical_open_tasks"] = summary.get(
-        "critical_open_tasks", updated["summary"]["critical_open_tasks"]
-    )
-    updated["summary"]["handoffs_at_risk"] = int(updated["handoff_queue"].shape[0])
-    updated["summary"]["recoverable_hours"] = summary.get(
-        "checklist_recoverable_hours", updated["summary"]["recoverable_hours"]
-    )
+    updated["summary"]["critical_open_tasks"] = summary.get("critical_open_tasks", updated["summary"]["critical_open_tasks"])
+    updated["summary"]["recoverable_hours"] = summary.get("checklist_recoverable_hours", updated["summary"]["recoverable_hours"])
     return updated
 
 
@@ -853,6 +863,169 @@ def _count_open_downstream(step, children_by_step, open_steps, memo):
 
     memo[step] = total
     return total
+
+
+def _checklist_action_fields(status, priority, owner, dependency_task, dependency_owner, downstream_open, estimated_hours):
+    status_weight = {
+        "Blocked": 5,
+        "Waiting on Input": 4,
+        "Not Started": 3,
+        "In Progress": 2,
+        "Completed": 0,
+    }.get(status, 1)
+    priority_weight = {"Critical": 5, "High": 3, "Medium": 2, "Low": 1}.get(priority, 1)
+    unblock_score = _clamp((status_weight * 10) + (priority_weight * 8) + min(downstream_open * 6, 24) + min(estimated_hours, 8))
+
+    if status == "Completed":
+        return "Completed", "Task complete; no further action required.", 0
+    if status == "Blocked":
+        return "Escalate owner", f"Escalate {owner} and clear the dependency handoff from {dependency_owner}.", unblock_score
+    if status == "Waiting on Input":
+        if dependency_task == "No upstream dependency":
+            return (
+                "Chase external input",
+                f"Obtain the missing external confirmation so {owner} can resume and release downstream steps.",
+                unblock_score,
+            )
+        return (
+            "Chase dependency",
+            f"Obtain the missing handoff from {dependency_owner} so {owner} can resume.",
+            unblock_score,
+        )
+    if priority == "Critical" and status == "Not Started":
+        return (
+            "Start in parallel",
+            f"Pre-stage support with {owner} and begin parallel prep before the upstream task fully closes.",
+            unblock_score,
+        )
+    if priority == "Critical" and status == "In Progress":
+        return (
+            "Protect same-day completion",
+            f"Keep {owner} on the critical path and hand off immediately to downstream teams.",
+            unblock_score,
+        )
+    return "Monitor", f"Keep {owner} on schedule and confirm the next dependency stays on track.", unblock_score
+
+
+def _derive_checklist_views(all_tasks):
+    all_tasks = all_tasks.copy()
+    if all_tasks.empty:
+        return {
+            "all_tasks": pd.DataFrame(),
+            "worklist": pd.DataFrame(),
+            "critical_path": pd.DataFrame(),
+            "handoff_queue": pd.DataFrame(),
+            "action_breakdown": pd.DataFrame(columns=["Action Lane", "Count"]),
+            "category_breakdown": pd.DataFrame(columns=["Category", "Open Tasks", "Hours at Risk"]),
+            "dependency_summary": {
+                "external_inputs": 0,
+                "upstream_in_progress": 0,
+                "upstream_not_started": 0,
+                "upstream_waiting": 0,
+                "completed_handoffs_open": 0,
+            },
+            "summary": {
+                "blocked_tasks": 0,
+                "waiting_tasks": 0,
+                "critical_open_tasks": 0,
+                "handoffs_at_risk": 0,
+                "recoverable_hours": 0,
+                "automation_candidates": 0,
+            },
+        }
+
+    all_tasks["Deadline Sort"] = pd.to_datetime(all_tasks["Deadline"], errors="coerce")
+    all_tasks = all_tasks.sort_values(["Step", "Deadline Sort"], ascending=[True, True], na_position="last").drop(
+        columns=["Deadline Sort"]
+    )
+    worklist = all_tasks.loc[~all_tasks["Status"].eq("Completed")].copy()
+    worklist = worklist.sort_values(["Unblock Score", "Estimated Hours", "Step"], ascending=[False, False, True])
+
+    critical_path = worklist.loc[
+        worklist["Priority"].eq("Critical"),
+        [
+            "Step",
+            "Category",
+            "Task",
+            "Status",
+            "Owner",
+            "Dependency Task",
+            "Downstream Open Tasks",
+            "Estimated Hours",
+            "Action Lane",
+            "Next Action",
+            "Unblock Score",
+        ],
+    ].copy()
+    handoff_queue = worklist.loc[
+        worklist["Status"].isin(["Blocked", "Waiting on Input"]),
+        [
+            "Step",
+            "Category",
+            "Task",
+            "Status",
+            "Priority",
+            "Owner",
+            "Dependency Task",
+            "Dependency Status",
+            "Dependency Owner",
+            "Estimated Hours",
+            "Action Lane",
+            "Next Action",
+            "Unblock Score",
+        ],
+    ].copy()
+    action_breakdown = worklist["Action Lane"].value_counts().rename_axis("Action Lane").reset_index(name="Count")
+    category_breakdown = (
+        worklist.groupby("Category")
+        .agg(**{"Open Tasks": ("Task", "count"), "Hours at Risk": ("Estimated Hours", "sum")})
+        .reset_index()
+        .sort_values(["Hours at Risk", "Open Tasks"], ascending=[False, False])
+    )
+    category_breakdown["Hours at Risk"] = category_breakdown["Hours at Risk"].round(1)
+
+    waiting_or_blocked = worklist["Status"].isin(["Blocked", "Waiting on Input"])
+    critical_open = worklist["Priority"].eq("Critical")
+    recoverable_hours = int(
+        round(
+            worklist.loc[waiting_or_blocked, "Estimated Hours"].max()
+            if waiting_or_blocked.any()
+            else worklist["Estimated Hours"].head(1).max()
+        )
+    ) if not worklist.empty else 0
+
+    automation_candidates = int(
+        worklist["Automation Potential"].astype(str).str.contains("High|AI candidate", case=False, na=False).sum()
+    )
+    dependency_summary = {
+        "external_inputs": int(worklist["Dependency Task"].eq("No upstream dependency").sum()),
+        "upstream_in_progress": int(worklist["Dependency Status"].eq("In Progress").sum()),
+        "upstream_not_started": int(worklist["Dependency Status"].eq("Not Started").sum()),
+        "upstream_waiting": int(worklist["Dependency Status"].eq("Waiting on Input").sum()),
+        "completed_handoffs_open": int(worklist["Dependency Status"].eq("Completed").sum()),
+    }
+
+    summary = {
+        "blocked_tasks": int(worklist["Status"].eq("Blocked").sum()),
+        "waiting_tasks": int(worklist["Status"].eq("Waiting on Input").sum()),
+        "critical_open_tasks": int(critical_open.sum()),
+        "handoffs_at_risk": int(
+            worklist.loc[waiting_or_blocked | critical_open, "Dependency Task"].ne("No upstream dependency").sum()
+        ),
+        "recoverable_hours": recoverable_hours,
+        "automation_candidates": automation_candidates,
+    }
+
+    return {
+        "all_tasks": all_tasks,
+        "worklist": worklist,
+        "critical_path": critical_path,
+        "handoff_queue": handoff_queue,
+        "action_breakdown": action_breakdown,
+        "category_breakdown": category_breakdown,
+        "dependency_summary": dependency_summary,
+        "summary": summary,
+    }
 
 
 def _build_action_queue(checklist):
@@ -1455,26 +1628,12 @@ def _build_audit_agent(bank_agent, ic_agent, journal_agent):
 
 def _build_checklist_agent(checklist):
     frame = checklist.copy()
+    if frame.empty:
+        return _derive_checklist_views(pd.DataFrame())
+
     frame["Dependency Step"] = frame["Dependencies"].apply(_dependency_step)
     open_mask = ~frame["Status"].eq("Completed")
     open_tasks = frame.loc[open_mask].copy()
-
-    if open_tasks.empty:
-        return {
-            "summary": {
-                "blocked_tasks": 0,
-                "waiting_tasks": 0,
-                "critical_open_tasks": 0,
-                "handoffs_at_risk": 0,
-                "recoverable_hours": 0,
-                "automation_candidates": 0,
-            },
-            "worklist": pd.DataFrame(),
-            "critical_path": pd.DataFrame(),
-            "handoff_queue": pd.DataFrame(),
-            "action_breakdown": pd.DataFrame(columns=["Action Lane", "Count"]),
-            "category_breakdown": pd.DataFrame(columns=["Category", "Open Tasks", "Hours at Risk"]),
-        }
 
     step_lookup = frame.set_index("Step")[
         ["Task", "Status", "Owner / Responsible", "Priority", "Category"]
@@ -1487,7 +1646,7 @@ def _build_checklist_agent(checklist):
     memo = {}
     records = []
 
-    for _, row in open_tasks.iterrows():
+    for _, row in frame.iterrows():
         step = int(row["Step"])
         dependency_step = row["Dependency Step"]
         dependency_record = step_lookup.get(int(dependency_step), {}) if pd.notna(dependency_step) else {}
@@ -1502,35 +1661,15 @@ def _build_checklist_agent(checklist):
         estimated_hours = float(pd.to_numeric(row["Estimated Hours"], errors="coerce") or 0)
         automation_potential = str(row["Automation Potential"])
         notes = str(row["Notes"]) if pd.notna(row["Notes"]) else ""
-
-        status_weight = {
-            "Blocked": 5,
-            "Waiting on Input": 4,
-            "Not Started": 3,
-            "In Progress": 2,
-        }.get(status, 1)
-        priority_weight = {"Critical": 5, "High": 3, "Medium": 2, "Low": 1}.get(priority, 1)
-        unblock_score = _clamp((status_weight * 10) + (priority_weight * 8) + min(downstream_open * 6, 24) + min(estimated_hours, 8))
-
-        if status == "Blocked":
-            action_lane = "Escalate owner"
-            next_action = f"Escalate {owner} and clear the dependency handoff from {dependency_owner}."
-        elif status == "Waiting on Input":
-            if dependency_task == "No upstream dependency":
-                action_lane = "Chase external input"
-                next_action = f"Obtain the missing external confirmation so {owner} can resume and release downstream steps."
-            else:
-                action_lane = "Chase dependency"
-                next_action = f"Obtain the missing handoff from {dependency_owner} so {owner} can resume."
-        elif priority == "Critical" and status == "Not Started":
-            action_lane = "Start in parallel"
-            next_action = f"Pre-stage support with {owner} and begin parallel prep before the upstream task fully closes."
-        elif priority == "Critical" and status == "In Progress":
-            action_lane = "Protect same-day completion"
-            next_action = f"Keep {owner} on the critical path and hand off immediately to downstream teams."
-        else:
-            action_lane = "Monitor"
-            next_action = f"Keep {owner} on schedule and confirm the next dependency stays on track."
+        action_lane, next_action, unblock_score = _checklist_action_fields(
+            status,
+            priority,
+            owner,
+            dependency_task,
+            dependency_owner,
+            downstream_open,
+            estimated_hours,
+        )
 
         records.append(
             {
@@ -1555,101 +1694,7 @@ def _build_checklist_agent(checklist):
             }
         )
 
-    worklist = pd.DataFrame(records).sort_values(
-        ["Unblock Score", "Estimated Hours"],
-        ascending=[False, False],
-    )
-    critical_path = worklist.loc[
-        worklist["Priority"].eq("Critical"),
-        [
-            "Step",
-            "Category",
-            "Task",
-            "Status",
-            "Owner",
-            "Dependency Task",
-            "Downstream Open Tasks",
-            "Estimated Hours",
-            "Action Lane",
-            "Next Action",
-            "Unblock Score",
-        ],
-    ].copy()
-    handoff_queue = worklist.loc[
-        worklist["Status"].isin(["Blocked", "Waiting on Input"]),
-        [
-            "Step",
-            "Category",
-            "Task",
-            "Status",
-            "Priority",
-            "Owner",
-            "Dependency Task",
-            "Dependency Status",
-            "Dependency Owner",
-            "Estimated Hours",
-            "Action Lane",
-            "Next Action",
-            "Unblock Score",
-        ],
-    ].copy()
-    action_breakdown = (
-        worklist["Action Lane"].value_counts().rename_axis("Action Lane").reset_index(name="Count")
-    )
-    category_breakdown = (
-        worklist.groupby("Category")
-        .agg(
-            **{
-                "Open Tasks": ("Task", "count"),
-                "Hours at Risk": ("Estimated Hours", "sum"),
-            }
-        )
-        .reset_index()
-        .sort_values(["Hours at Risk", "Open Tasks"], ascending=[False, False])
-    )
-    category_breakdown["Hours at Risk"] = category_breakdown["Hours at Risk"].round(1)
-
-    waiting_or_blocked = worklist["Status"].isin(["Blocked", "Waiting on Input"])
-    critical_open = worklist["Priority"].eq("Critical")
-    recoverable_hours = int(
-        round(
-            worklist.loc[waiting_or_blocked, "Estimated Hours"].max()
-            if waiting_or_blocked.any()
-            else worklist["Estimated Hours"].head(1).max()
-        )
-    )
-
-    automation_candidates = int(
-        worklist["Automation Potential"].astype(str).str.contains("High|AI candidate", case=False, na=False).sum()
-    )
-    dependency_summary = {
-        "external_inputs": int(worklist["Dependency Task"].eq("No upstream dependency").sum()),
-        "upstream_in_progress": int(worklist["Dependency Status"].eq("In Progress").sum()),
-        "upstream_not_started": int(worklist["Dependency Status"].eq("Not Started").sum()),
-        "upstream_waiting": int(worklist["Dependency Status"].eq("Waiting on Input").sum()),
-        "completed_handoffs_open": int(worklist["Dependency Status"].eq("Completed").sum()),
-    }
-
-    summary = {
-        "blocked_tasks": int(worklist["Status"].eq("Blocked").sum()),
-        "waiting_tasks": int(worklist["Status"].eq("Waiting on Input").sum()),
-        "critical_open_tasks": int(critical_open.sum()),
-        "handoffs_at_risk": int(
-            worklist.loc[waiting_or_blocked | critical_open, "Dependency Task"].ne("No upstream dependency").sum()
-        ),
-        "recoverable_hours": recoverable_hours,
-        "automation_candidates": automation_candidates,
-    }
-
-    return {
-        "summary": summary,
-        "dependency_summary": dependency_summary,
-        "worklist": worklist,
-        "critical_path": critical_path,
-        "handoff_queue": handoff_queue,
-        "action_breakdown": action_breakdown,
-        "category_breakdown": category_breakdown,
-    }
+    return _derive_checklist_views(pd.DataFrame(records))
 
 
 def _build_ic_agent(ic):
@@ -2699,6 +2744,14 @@ def calculate_readiness_score(kpis):
         "gap_to_target_days": gap_to_target_days,
         "continuous_gap_to_target_days": continuous_gap_to_target_days,
         "penalties": penalties,
+        "summary_snapshot": {
+            "pending_gl": summary["pending_gl"],
+            "bank_exceptions": summary["bank_exceptions"],
+            "ic_exceptions": summary["ic_exceptions"],
+            "ap_3way_exceptions": summary["ap_3way_exceptions"],
+            "blocked_tasks": summary["blocked_tasks"],
+            "riskiest_entity": summary["riskiest_entity"],
+        },
     }
 
 
@@ -3150,6 +3203,22 @@ def simulate_close_scenario(kpis, selected_action_ids):
     summary["checklist_handoffs_at_risk"] = scenario["agents"]["checklist"]["summary"]["handoffs_at_risk"]
     summary["checklist_recoverable_hours"] = scenario["agents"]["checklist"]["summary"]["recoverable_hours"]
     summary["checklist_automation_candidates"] = scenario["agents"]["checklist"]["summary"]["automation_candidates"]
+    checklist_total = int(sum(base_summary.get("checklist_status_counts", {}).values()))
+    summary["in_progress_tasks"] = max(
+        0,
+        checklist_total
+        - summary.get("completed_tasks", 0)
+        - summary.get("not_started_tasks", 0)
+        - summary.get("waiting_tasks", 0)
+        - summary.get("blocked_tasks", 0),
+    )
+    summary["checklist_status_counts"] = {
+        "Completed": int(summary.get("completed_tasks", 0)),
+        "In Progress": int(summary.get("in_progress_tasks", 0)),
+        "Not Started": int(summary.get("not_started_tasks", 0)),
+        "Waiting on Input": int(summary.get("waiting_tasks", 0)),
+        "Blocked": int(summary.get("blocked_tasks", 0)),
+    }
 
     scenario["areas"] = _apply_summary_to_areas(summary, scenario["areas"])
 
